@@ -20,7 +20,5 @@ export default defineConfig({
   worker: {
     format: 'es',         // AudioWorklet needs ES module format
   },
-  optimizeDeps: {
-    exclude: ['tone'],    // Tone.js must not be pre-bundled
-  },
 })
+
