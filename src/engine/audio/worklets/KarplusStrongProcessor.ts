@@ -37,6 +37,15 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
         case 'noteOff':
           this.releaseVoice(msg.voiceId);
           break;
+        case 'setGlobalParams':
+          // Update all active (non-releasing) voices with new decay/brightness
+          for (const voice of this.voices.values()) {
+            if (!voice.releasing) {
+              if (msg.decay !== undefined) voice.loopGain = msg.decay;
+              if (msg.brightness !== undefined) voice.brightness = msg.brightness;
+            }
+          }
+          break;
       }
     };
   }

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { KeyboardCanvas } from './components/KeyboardCanvas'
 import { useAudioEngine } from './engine/audio/useAudioEngine'
 import { VoiceManager } from './engine/audio/VoiceManager'
@@ -34,9 +34,9 @@ const SCALES: Record<string, { name: string; degrees: number[] }> = {
 const FACTORY_PRESETS: Preset[] = [
   {
     id: 'shred-lead',
-    name: 'Shred Lead (Guitar)',
-    rows: 4,
-    startMidiNote: 52, // E3
+    name: 'On The Road',
+    rows: 6,
+    startMidiNote: 40, // E2
     scaleName: 'chromatic',
     scale: SCALES.chromatic.degrees,
     rootNote: 4, // E
@@ -50,12 +50,12 @@ const FACTORY_PRESETS: Preset[] = [
   },
   {
     id: 'sitar-raga',
-    name: 'Sitar Raga (Carnatic)',
+    name: 'Sitar Raga',
     rows: 4,
-    startMidiNote: 48, // C3
+    startMidiNote: 48,
     scaleName: 'mayamalavagowla',
     scale: SCALES.mayamalavagowla.degrees,
-    rootNote: 0, // C
+    rootNote: 0,
     snapEnabled: true,
     roundEnabled: true,
     slideSpeed: 0.25,
@@ -68,10 +68,10 @@ const FACTORY_PRESETS: Preset[] = [
     id: 'acoustic-steel',
     name: 'Acoustic Steel',
     rows: 6,
-    startMidiNote: 40, // E2
+    startMidiNote: 40,
     scaleName: 'major',
     scale: SCALES.major.degrees,
-    rootNote: 0, // C
+    rootNote: 0,
     snapEnabled: true,
     roundEnabled: true,
     slideSpeed: 0.05,
@@ -84,16 +84,25 @@ const FACTORY_PRESETS: Preset[] = [
 
 export default function App() {
   const audioEngine = useAudioEngine()
-  
-  // Initialize VoiceManager once
-  const voiceManagerRef = useRef<VoiceManager | null>(null)
-  if (!voiceManagerRef.current) {
-    voiceManagerRef.current = new VoiceManager(audioEngine, 'poly')
-  }
-  
-  // App settings state
+
+  // ALL useRef/useState hooks MUST be called unconditionally and in same order every render
   const [presets, setPresets] = useState<Preset[]>(FACTORY_PRESETS)
   const [activePresetIndex, setActivePresetIndex] = useState<number>(0)
+  const [octave, setOctave] = useState<number>(2)
+  const [showSvara, setShowSvara] = useState<boolean>(false)
+  const [isDiatonic, setIsDiatonic] = useState<boolean>(FACTORY_PRESETS[0].diatonicEnabled)
+  const [showPresetMenu, setShowPresetMenu] = useState<boolean>(false)
+  const [playMode, setPlayMode] = useState<'String' | 'Poly' | 'Mono'>('String')
+
+  const audioEngineRef = useRef(audioEngine)
+  audioEngineRef.current = audioEngine
+
+  // VoiceManager init using lazy ref — safe, no conditional hooks
+  const voiceManagerRef = useRef<VoiceManager | null>(null)
+  if (voiceManagerRef.current === null) {
+    voiceManagerRef.current = new VoiceManager(audioEngineRef.current, 'string')
+  }
+
   const activePreset = presets[activePresetIndex]
 
   // Dexie DB Sync on mount
@@ -102,7 +111,6 @@ export default function App() {
       try {
         const count = await db.presets.count()
         if (count === 0) {
-          // Pre-populate DB with factory defaults
           const dbPresets: DbPreset[] = FACTORY_PRESETS.map(p => ({
             id: p.id,
             name: p.name,
@@ -136,7 +144,6 @@ export default function App() {
           }))
           await db.presets.bulkAdd(dbPresets)
         }
-
         const loaded = await db.presets.toArray()
         const mapped = loaded.map(p => ({
           id: p.id,
@@ -156,32 +163,19 @@ export default function App() {
         }))
         setPresets(mapped)
       } catch (e) {
-        console.error('Dexie DB Sync error:', e)
+        console.error('DB sync error:', e)
       }
     }
     syncDb()
   }, [])
 
-  const [showSvara, setShowSvara] = useState<boolean>(false)
-  const [isDiatonic, setIsDiatonic] = useState<boolean>(activePreset.diatonicEnabled)
-  const [showMenu, setShowMenu] = useState<boolean>(false)
-
-  // Track XY values
-  const [xyVal, setXyVal] = useState<{ x: number; y: number }>({ x: 0.5, y: 0.5 })
-  const xyPadRef = useRef<HTMLDivElement>(null)
-
-  // Track Whammy value (height offset from center)
-  const [whammyVal, setWhammyVal] = useState<number>(0.5) // 0.5 is centered / zero bend
-  const whammyRef = useRef<HTMLDivElement>(null)
-
-  // Sync state with active preset on load/change
   useEffect(() => {
     setIsDiatonic(activePreset.diatonicEnabled)
   }, [activePreset])
 
   useEffect(() => {
     if (voiceManagerRef.current) {
-      const mode = activePreset.id === 'shred-lead' ? 'string' : 'poly'
+      const mode = playMode === 'String' ? 'string' : playMode === 'Poly' ? 'poly' : 'mono'
       voiceManagerRef.current.setPlayMode(mode)
       voiceManagerRef.current.setConfig({
         snapEnabled: activePreset.snapEnabled,
@@ -191,22 +185,24 @@ export default function App() {
         temperamentOffsets: new Array(12).fill(0)
       })
     }
-  }, [activePreset, isDiatonic])
+  }, [activePreset, isDiatonic, playMode])
 
-  // Sync Audio Engine parameters with preset values
+  // Apply audio params whenever preset values change
   useEffect(() => {
     audioEngine.setMasterVolume(activePreset.volValue)
+  }, [audioEngine, activePreset.volValue])
 
+  useEffect(() => {
     const decay = 0.998 - activePreset.dampingValue * 0.015
-    audioEngine.setPhysicalModelParams({
-      decay,
-      brightness: 0.3 + (1 - activePreset.dampingValue) * 0.5
-    })
+    const brightness = 0.3 + (1 - activePreset.dampingValue) * 0.5
+    audioEngine.setPhysicalModelParams({ decay, brightness })
+  }, [audioEngine, activePreset.dampingValue])
 
-    audioEngine.setEffectEnabled('chorus', activePreset.vibValue > 0.05)
-  }, [audioEngine, activePreset.volValue, activePreset.dampingValue, activePreset.vibValue])
+  useEffect(() => {
+    audioEngine.setVibratoDepth(activePreset.vibValue)
+  }, [audioEngine, activePreset.vibValue])
 
-  // Configure default preset effects
+  // Effect presets per instrument
   useEffect(() => {
     if (activePreset.id === 'shred-lead') {
       audioEngine.setEffectEnabled('distortion', true)
@@ -226,123 +222,69 @@ export default function App() {
     }
   }, [audioEngine, activePreset.id])
 
-  // Handle Preset Selection
-  const selectPreset = (index: number) => {
-    setActivePresetIndex(index)
-    setShowMenu(false)
-  }
+  // Slider drag handler
+  const updatePresetValue = useCallback(async (key: 'volValue' | 'vibValue' | 'dampingValue', val: number) => {
+    setPresets(prev => prev.map((p, idx) =>
+      idx === activePresetIndex ? { ...p, [key]: val } : p
+    ))
 
-  // Handle XY Pad Pointer Events
-  const handleXyPointerMove = (e: React.PointerEvent) => {
-    const pad = xyPadRef.current
-    if (!pad) return
-    const rect = pad.getBoundingClientRect()
-    
-    // Calculate normalized coordinates
-    let x = (e.clientX - rect.left) / rect.width
-    let y = 1 - (e.clientY - rect.top) / rect.height
-    
-    // Clamp to 0-1
-    x = Math.max(0, Math.min(1, x))
-    y = Math.max(0, Math.min(1, y))
-    
-    setXyVal({ x, y })
-    
-    // Update active voices with expression CC values (CC74 = Y, CC1 = X)
-    // In our simplified osc synthesis, we pass expression parameter shifts
-  }
+    // Immediately apply to audio engine
+    if (key === 'volValue') {
+      audioEngine.setMasterVolume(val)
+    } else if (key === 'vibValue') {
+      audioEngine.setVibratoDepth(val)
+    } else if (key === 'dampingValue') {
+      const decay = 0.998 - val * 0.015
+      const brightness = 0.3 + (1 - val) * 0.5
+      audioEngine.setPhysicalModelParams({ decay, brightness })
+    }
 
-  const handleXyPointerDown = (e: React.PointerEvent) => {
-    e.currentTarget.setPointerCapture(e.pointerId)
-    handleXyPointerMove(e)
-  }
-
-  const handleXyPointerUp = () => {
-    // Reset to center on release
-    setXyVal({ x: 0.5, y: 0.5 })
-  }
-
-  // Handle Whammy Bar Pointer Events (Pitch Bend)
-  const handleWhammyPointerMove = (e: React.PointerEvent) => {
-    const bar = whammyRef.current
-    if (!bar) return
-    const rect = bar.getBoundingClientRect()
-    
-    // Calculate normalized value
-    let val = 1 - (e.clientY - rect.top) / rect.height
-    val = Math.max(0, Math.min(1, val))
-    
-    setWhammyVal(val)
-    // Apply pitch bend to audio engine (e.g. translate 0-1 to global detune offset of +/- 200 cents bend)
-    // Broadcast global pitch bend to active voices (updates the active detune)
-  }
-
-  const handleWhammyPointerDown = (e: React.PointerEvent) => {
-    e.currentTarget.setPointerCapture(e.pointerId)
-    handleWhammyPointerMove(e)
-  }
-
-  const handleWhammyPointerUp = () => {
-    // Return to center (spring action)
-    setWhammyVal(0.5)
-  }
-
-  // Handle Slot Slider Changes
-  const updatePresetValue = async (key: 'volValue' | 'vibValue' | 'dampingValue', val: number) => {
-    setPresets(prev => prev.map((p, idx) => {
-      if (idx === activePresetIndex) {
-        return { ...p, [key]: val }
-      }
-      return p
-    }))
-
-    // Persist to IndexedDB
     try {
       const active = presets[activePresetIndex]
       if (active) {
-        await db.presets.update(active.id, {
-          [`controlSurface.${key}`]: val
-        })
+        await db.presets.update(active.id, { [`controlSurface.${key}`]: val })
       }
     } catch (e) {
-      console.error('Error updating preset slider in Dexie:', e)
+      console.error('Error updating preset slider:', e)
     }
-  }
+  }, [audioEngine, activePresetIndex, presets])
 
-  // Helper to trigger slot slider drag
-  const handleSliderDrag = (
+  const handleSliderDrag = useCallback((
     e: React.PointerEvent,
     key: 'volValue' | 'vibValue' | 'dampingValue'
   ) => {
+    e.preventDefault()
     e.currentTarget.setPointerCapture(e.pointerId)
     const track = e.currentTarget
-    const updateValue = (moveEvent: any) => {
+
+    const updateValue = (evt: PointerEvent | React.PointerEvent) => {
       const rect = track.getBoundingClientRect()
-      let val = 1 - (moveEvent.clientY - rect.top) / rect.height
+      let val = 1 - (evt.clientY - rect.top) / rect.height
       val = Math.max(0, Math.min(1, val))
       updatePresetValue(key, val)
     }
 
-    updateValue(e)
+    updateValue(e as unknown as PointerEvent)
 
-    const onPointerMove = (moveEvent: PointerEvent) => {
-      updateValue(moveEvent)
+    const onMove = (moveEvt: PointerEvent) => updateValue(moveEvt)
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
     }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }, [updatePresetValue])
 
-    const onPointerUp = () => {
-      window.removeEventListener('pointermove', onPointerMove)
-      window.removeEventListener('pointerup', onPointerUp)
-    }
-
-    window.addEventListener('pointermove', onPointerMove)
-    window.addEventListener('pointerup', onPointerUp)
+  const selectPreset = (index: number) => {
+    setActivePresetIndex(index)
+    setShowPresetMenu(false)
   }
 
-  // Create layout configuration for KeyboardCanvas
+  // Layout config
   const layoutConfig: LayoutConfig = {
     rows: activePreset.rows,
-    rowIntervalSemitones: activePreset.rows === 6 ? [5, 5, 5, 4, 5] : [5], // guitar vs standard fourths
-    startMidiNote: activePreset.startMidiNote,
+    rowIntervalSemitones: activePreset.rows === 6 ? [5, 5, 5, 4, 5] : [5],
+    startMidiNote: activePreset.startMidiNote + (octave - 2) * 12,
     keyWidth: 80,
     keyHeight: 120,
     rootNote: activePreset.rootNote,
@@ -350,190 +292,175 @@ export default function App() {
   }
 
   return (
-    <div className="app-container">
-      {/* Header Panel */}
-      <header className="app-header">
-        <div className="header-left">
-          <button className="hamburger-btn" onClick={() => setShowMenu(prev => !prev)}>
-            ≡
-          </button>
-          <div className="preset-selector" onClick={() => setShowMenu(prev => !prev)}>
-            <span className="preset-name">{activePreset.name}</span>
-            <span style={{ fontSize: '10px' }}>▼</span>
+    <div className="gs-app">
+      {/* ═══ TOP TOOLBAR ═══ */}
+      <header className="gs-toolbar">
+
+        {/* Octave Selector */}
+        <div className="gs-octave-group">
+          <div className="gs-octave-label">Octave</div>
+          <div className="gs-octave-controls">
+            <button
+              className="gs-octave-btn"
+              onClick={() => setOctave(o => Math.max(0, o - 1))}
+              aria-label="Decrease octave"
+            >‹</button>
+            <span className="gs-octave-value">{octave}</span>
+            <button
+              className="gs-octave-btn"
+              onClick={() => setOctave(o => Math.min(6, o + 1))}
+              aria-label="Increase octave"
+            >›</button>
+          </div>
+          <div className="gs-auto-label">Auto</div>
+        </div>
+
+        {/* Expression / XY Pad */}
+        <div className="gs-expr-group">
+          <div className="gs-expr-label-row">
+            <span className="gs-expr-title">Expression</span>
+          </div>
+          <div className="gs-expr-inner">
+            {/* Circular XY pad */}
+            <div className="gs-xy-container">
+              <div className="gs-xy-labels">
+                <span className="gs-xy-label-v">Guitar/Feedback</span>
+              </div>
+              <div className="gs-xy-pad" id="xy-pad">
+                <div className="gs-xy-crosshair" style={{ left: '50%', top: '50%' }} />
+                <div className="gs-xy-rings" />
+              </div>
+              <div className="gs-xy-label-h">Guitar/Distance</div>
+            </div>
+
+            {/* Vertical Sliders: Fret Excitation, Whammy, Vibrato, Depth, Filter */}
+            {[
+              { key: 'volValue' as const, label: 'Fret\nExcitation', val: activePreset.volValue, color: '#00e5ff' },
+              { key: 'vibValue' as const, label: 'Whammy', val: activePreset.vibValue, color: '#ff6b35' },
+              { key: 'dampingValue' as const, label: 'Vibrato\nDepth', val: activePreset.vibValue, color: '#00e5ff' },
+            ].map(({ key, label, val, color }) => (
+              <div className="gs-vslider-group" key={key}>
+                <div className="gs-vslider-label">{label}</div>
+                <div
+                  className="gs-vslider-track"
+                  id={`slider-${key}`}
+                  onPointerDown={(e) => handleSliderDrag(e, key)}
+                >
+                  <div
+                    className="gs-vslider-fill"
+                    style={{ height: `${val * 100}%`, background: color }}
+                  />
+                  <div
+                    className="gs-vslider-handle"
+                    style={{ bottom: `calc(${val * 100}% - 6px)`, borderColor: color }}
+                  />
+                </div>
+              </div>
+            ))}
+
+            {/* Filter slider (damping) */}
+            <div className="gs-vslider-group">
+              <div className="gs-vslider-label">Filter</div>
+              <div
+                className="gs-vslider-track"
+                id="slider-filter"
+                onPointerDown={(e) => handleSliderDrag(e, 'dampingValue')}
+              >
+                <div
+                  className="gs-vslider-fill"
+                  style={{ height: `${activePreset.dampingValue * 100}%`, background: '#4fc3f7' }}
+                />
+                <div
+                  className="gs-vslider-handle"
+                  style={{ bottom: `calc(${activePreset.dampingValue * 100}% - 6px)`, borderColor: '#4fc3f7' }}
+                />
+              </div>
+            </div>
           </div>
         </div>
 
-        <div className="header-right">
-          <button 
-            className="nav-btn" 
-            onClick={() => setShowSvara(prev => !prev)}
-            style={{ color: showSvara ? '#ffd700' : '#888' }}
-          >
-            {showSvara ? 'SVARA' : 'WESTERN'}
-          </button>
-          <button 
-            className="nav-btn" 
-            onClick={() => setIsDiatonic(prev => !prev)}
-            style={{ color: isDiatonic ? '#00e5ff' : '#888' }}
-          >
-            {isDiatonic ? 'DIATONIC' : 'CHROMATIC'}
-          </button>
-          <button className="settings-btn" onClick={() => selectPreset((activePresetIndex + 1) % presets.length)}>
-            ⚙
-          </button>
+        {/* Mode Button Grid */}
+        <div className="gs-mode-group">
+          <div className="gs-mode-row">
+            {['2nd\nHmonic', 'Piano'].map(m => (
+              <button key={m} className="gs-mode-btn" style={{ whiteSpace: 'pre-line' }}>{m}</button>
+            ))}
+            <button className="gs-mode-btn gs-mode-active">Play\nTrack</button>
+          </div>
+          <div className="gs-mode-row">
+            <button
+              className={`gs-mode-btn ${!isDiatonic ? 'gs-mode-active' : ''}`}
+              onClick={() => setIsDiatonic(false)}
+            >Guitar</button>
+            <button className="gs-mode-btn">Pinch\nHmonic\nOn\nRelease</button>
+            <button
+              className={`gs-mode-btn ${isDiatonic ? 'gs-mode-active' : ''}`}
+              onClick={() => setIsDiatonic(true)}
+            >Diatonic</button>
+          </div>
+          <div className="gs-mode-row">
+            <button
+              className={`gs-mode-btn ${showSvara ? 'gs-mode-active' : ''}`}
+              onClick={() => setShowSvara(v => !v)}
+            >Slide</button>
+          </div>
+        </div>
+
+        {/* Right Controls */}
+        <div className="gs-right-group">
+          <div className="gs-presets-label">All Presets Play</div>
+          <div className="gs-track-row">
+            <div className="gs-knob-group">
+              <div className="gs-knob" />
+              <div className="gs-knob-label">Track Vol</div>
+            </div>
+            <div className="gs-track-counter">
+              <span className="gs-track-num">1/174</span>
+            </div>
+          </div>
+
+          {/* Preset Selector */}
+          <div className="gs-preset-selector" onClick={() => setShowPresetMenu(v => !v)}>
+            <span className="gs-preset-name">{activePreset.name}</span>
+            <span className="gs-preset-arrow">▾</span>
+          </div>
+
+          <div className="gs-playmode-row">
+            <span className="gs-playmode-label">Play Mode:</span>
+            {(['String', 'Poly', 'Mono'] as const).map(m => (
+              <button
+                key={m}
+                className={`gs-playmode-btn ${playMode === m ? 'gs-playmode-active' : ''}`}
+                onClick={() => setPlayMode(m)}
+              >{m}</button>
+            ))}
+          </div>
         </div>
       </header>
 
-      {/* Preset Dropdown Menu */}
-      {showMenu && (
-        <div style={{
-          position: 'absolute',
-          top: '52px',
-          left: '16px',
-          backgroundColor: '#1a1a2e',
-          border: '1px solid #31314d',
-          borderRadius: '6px',
-          zIndex: 100,
-          boxShadow: '0 8px 16px rgba(0,0,0,0.5)',
-          overflow: 'hidden'
-        }}>
-          {presets.map((preset, idx) => (
+      {/* Preset Dropdown */}
+      {showPresetMenu && (
+        <div className="gs-preset-dropdown">
+          {presets.map((p, idx) => (
             <div
-              key={preset.id}
+              key={p.id}
+              className={`gs-preset-item ${idx === activePresetIndex ? 'gs-preset-item-active' : ''}`}
               onClick={() => selectPreset(idx)}
-              style={{
-                padding: '12px 24px',
-                cursor: 'pointer',
-                color: idx === activePresetIndex ? '#ffd700' : '#e2e8f0',
-                backgroundColor: idx === activePresetIndex ? '#262642' : 'transparent',
-                fontWeight: idx === activePresetIndex ? 'bold' : 'normal',
-                borderBottom: '1px solid #23233c'
-              }}
             >
-              {preset.name}
+              {p.name}
             </div>
           ))}
         </div>
       )}
 
-      {/* Control Surface Panel */}
-      <section className="control-surface">
-        {/* XY Pad */}
-        <div 
-          className="xy-pad" 
-          ref={xyPadRef}
-          onPointerDown={handleXyPointerDown}
-          onPointerMove={handleXyPointerMove}
-          onPointerUp={handleXyPointerUp}
-          onPointerCancel={handleXyPointerUp}
-        >
-          <div className="xy-pad-grid" />
-          <div 
-            className="xy-pad-crosshair" 
-            style={{ 
-              left: `${xyVal.x * 100}%`, 
-              top: `${(1 - xyVal.y) * 100}%` 
-            }} 
-          />
-          <div style={{
-            position: 'absolute',
-            bottom: '4px',
-            left: '4px',
-            fontSize: '9px',
-            color: '#94a3b8',
-            pointerEvents: 'none',
-            fontWeight: 'bold'
-          }}>
-            XY MOD PAD
-          </div>
-        </div>
-
-        {/* Whammy Pitch Bend */}
-        <div 
-          className="whammy-bar-container"
-          ref={whammyRef}
-          onPointerDown={handleWhammyPointerDown}
-          onPointerMove={handleWhammyPointerMove}
-          onPointerUp={handleWhammyPointerUp}
-          onPointerCancel={handleWhammyPointerUp}
-        >
-          <div 
-            className="whammy-bar" 
-            style={{ 
-              bottom: '4px',
-              height: '8px',
-              top: `${(1 - whammyVal) * 90}%`
-            }} 
-          />
-          <div className="whammy-label">BEND</div>
-        </div>
-
-        {/* Dynamic Slot Sliders */}
-        <div className="slots-container">
-          <div className="slot-control">
-            <span className="slot-label">VOLUME</span>
-            <div 
-              className="slot-slider-track"
-              onPointerDown={(e) => handleSliderDrag(e, 'volValue')}
-            >
-              <div 
-                className="slot-slider-fill" 
-                style={{ height: `${activePreset.volValue * 100}%` }} 
-              />
-              <div 
-                className="slot-slider-handle" 
-                style={{ bottom: `${activePreset.volValue * 100}%` }} 
-              />
-            </div>
-            <span className="slot-value">{Math.round(activePreset.volValue * 100)}%</span>
-          </div>
-
-          <div className="slot-control">
-            <span className="slot-label">VIBRATO</span>
-            <div 
-              className="slot-slider-track"
-              onPointerDown={(e) => handleSliderDrag(e, 'vibValue')}
-            >
-              <div 
-                className="slot-slider-fill" 
-                style={{ height: `${activePreset.vibValue * 100}%` }} 
-              />
-              <div 
-                className="slot-slider-handle" 
-                style={{ bottom: `${activePreset.vibValue * 100}%` }} 
-              />
-            </div>
-            <span className="slot-value">{Math.round(activePreset.vibValue * 100)}%</span>
-          </div>
-
-          <div className="slot-control">
-            <span className="slot-label">DAMPING</span>
-            <div 
-              className="slot-slider-track"
-              onPointerDown={(e) => handleSliderDrag(e, 'dampingValue')}
-            >
-              <div 
-                className="slot-slider-fill" 
-                style={{ height: `${activePreset.dampingValue * 100}%` }} 
-              />
-              <div 
-                className="slot-slider-handle" 
-                style={{ bottom: `${activePreset.dampingValue * 100}%` }} 
-              />
-            </div>
-            <span className="slot-value">{Math.round(activePreset.dampingValue * 100)}%</span>
-          </div>
-        </div>
-      </section>
-
-      {/* Keyboard Grid Panel */}
-      <section className="keyboard-panel">
-        <KeyboardCanvas 
+      {/* ═══ KEYBOARD GRID ═══ */}
+      <main className="gs-keyboard">
+        <KeyboardCanvas
           config={layoutConfig}
           voiceManager={voiceManagerRef.current}
           showSvara={showSvara}
         />
-      </section>
+      </main>
     </div>
   )
 }

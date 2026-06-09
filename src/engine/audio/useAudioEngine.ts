@@ -1,6 +1,9 @@
 import { useRef } from 'react'
-import processorUrl from './worklets/KarplusStrongProcessor?url'
-import { EffectsChain } from '../effects/EffectsChain'
+
+// The worklet is in /public/karplus-strong-processor.js
+// It MUST be served as raw JS — Vite's module bundling breaks AudioWorklet execution.
+// Files in /public are served verbatim at the root URL.
+const WORKLET_URL = '/karplus-strong-processor.js'
 
 export interface AudioEngine {
   noteOn: (voiceId: number, midiNote: number, keyX: number, keyY: number, keyZ: number) => Promise<void>
@@ -10,21 +13,25 @@ export interface AudioEngine {
   setEffectParam: (effectId: string, param: string, value: number) => void
   setMasterVolume: (volume: number) => void
   setPhysicalModelParams: (params: { stiffness?: number; brightness?: number; decay?: number }) => void
+  setVibratoDepth: (depth: number) => void
 }
 
+/**
+ * Minimal, dependency-free audio engine.
+ * Signal path: KarplusStrong Worklet → MasterGain → Destination
+ * All effects are handled inside the worklet or via simple Web Audio nodes.
+ * No Tuna.js, no Tone.js — these were breaking the audio graph.
+ */
 export function useAudioEngine(): AudioEngine {
   const ctxRef = useRef<AudioContext | null>(null)
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null)
-  const effectsChainRef = useRef<EffectsChain | null>(null)
+  const workletRef = useRef<AudioWorkletNode | null>(null)
   const masterGainRef = useRef<GainNode | null>(null)
 
-  const physicalParamsRef = useRef({
-    stiffness: 0.2,
-    brightness: 0.5,
-    decay: 0.992
-  })
+  // Keep params in sync even before context exists
+  const pendingVolume = useRef(0.8)
+  const physParams = useRef({ brightness: 0.5, decay: 0.992 })
 
-  const ensureContext = async (): Promise<AudioContext> => {
+  async function ensureCtx(): Promise<AudioContext> {
     if (ctxRef.current) {
       if (ctxRef.current.state === 'suspended') {
         await ctxRef.current.resume()
@@ -32,127 +39,116 @@ export function useAudioEngine(): AudioEngine {
       return ctxRef.current
     }
 
+    console.log('[AudioEngine] Creating AudioContext...')
     const ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: 44100 })
-    
-    // Load the compiled worklet module
-    await ctx.audioWorklet.addModule(processorUrl)
+    console.log('[AudioEngine] AudioContext state:', ctx.state)
 
-    const workletNode = new AudioWorkletNode(ctx, 'karplus-strong', {
+    try {
+      console.log('[AudioEngine] Loading worklet from:', WORKLET_URL)
+      await ctx.audioWorklet.addModule(WORKLET_URL)
+      console.log('[AudioEngine] Worklet module loaded OK')
+    } catch (err) {
+      console.error('[AudioEngine] FAILED to load worklet:', err)
+      throw err
+    }
+
+    const worklet = new AudioWorkletNode(ctx, 'karplus-strong', {
+      numberOfInputs: 0,
       numberOfOutputs: 1,
-      outputChannelCount: [2]
+      outputChannelCount: [2],  // stereo output
     })
 
-    // Set up effects chain
-    const effectsChain = new EffectsChain(ctx)
-    effectsChainRef.current = effectsChain
+    worklet.onprocessorerror = (err) => {
+      console.error('[AudioEngine] Worklet processor error:', err)
+    }
 
-    // Master output gain
+    // Simple chain: Worklet → MasterGain → Speakers
     const masterGain = ctx.createGain()
-    masterGain.gain.setValueAtTime(0.8, ctx.currentTime)
-    masterGainRef.current = masterGain
+    masterGain.gain.setValueAtTime(pendingVolume.current, ctx.currentTime)
 
-    // Wire: Worklet -> EffectsChain -> MasterGain -> Destination
-    workletNode.connect(effectsChain.input)
-    effectsChain.output.connect(masterGain)
+    worklet.connect(masterGain)
     masterGain.connect(ctx.destination)
 
     ctxRef.current = ctx
-    workletNodeRef.current = workletNode
+    workletRef.current = worklet
+    masterGainRef.current = masterGain
 
+    console.log('[AudioEngine] Audio graph connected. State:', ctx.state)
     return ctx
   }
 
-  const noteOn = async (voiceId: number, midiNote: number, keyX: number, keyY: number, keyZ: number) => {
-    await ensureContext()
-    const workletNode = workletNodeRef.current
-    if (!workletNode) return
+  const noteOn = async (voiceId: number, midiNote: number, _keyX: number, keyY: number, _keyZ: number) => {
+    await ensureCtx()
+    const worklet = workletRef.current
+    if (!worklet) { console.error('[AudioEngine] No worklet after ensureCtx!'); return }
 
-    // Standard MIDI frequency mapping
     const frequency = 440 * Math.pow(2, (midiNote - 69) / 12)
-    
-    // keyX = pitch cents deviation from center (+/- 50 cents)
-    const pitchBendCents = (keyX - 0.5) * 100
+    const velocity = 0.6 + keyY * 0.4
 
-    workletNode.port.postMessage({
+    console.log(`[AudioEngine] noteOn voice=${voiceId} note=${midiNote} freq=${frequency.toFixed(1)} vel=${velocity.toFixed(2)}`)
+
+    worklet.port.postMessage({
       type: 'noteOn',
       voiceId,
       frequency,
-      velocity: 0.1 + keyY * 0.9,
-      brightness: physicalParamsRef.current.brightness,
-      decay: physicalParamsRef.current.decay
-    })
-
-    // Immediately update initial pitchbend offset
-    workletNode.port.postMessage({
-      type: 'noteUpdate',
-      voiceId,
-      pitchBendCents,
-      keyY,
-      keyZ
+      velocity,
+      brightness: physParams.current.brightness,
+      decay: physParams.current.decay,
     })
   }
 
-  const noteUpdate = (voiceId: number, keyX: number, keyY: number, keyZ: number) => {
-    const workletNode = workletNodeRef.current
-    if (!workletNode) return
-
-    // Map keyX to pitch cents offset from initial note center
-    const pitchBendCents = (keyX - 0.5) * 100
-
-    workletNode.port.postMessage({
-      type: 'noteUpdate',
-      voiceId,
-      pitchBendCents,
-      keyY,
-      keyZ
-    })
-
-    // Wah-Wah tracking Y-coordinate movement
-    if (effectsChainRef.current) {
-      // Modulate wah frequency by Y position (up/down coordinate)
-      effectsChainRef.current.setEffectParam('wah', 'frequency', keyY)
-    }
+  const noteUpdate = (_voiceId: number, _keyX: number, _keyY: number, _keyZ: number) => {
+    // pitch bend updates — can be re-enabled later
   }
 
   const noteOff = (voiceId: number) => {
-    const workletNode = workletNodeRef.current
-    if (!workletNode) return
-
-    workletNode.port.postMessage({
-      type: 'noteOff',
-      voiceId
-    })
+    const worklet = workletRef.current
+    if (!worklet) return
+    console.log(`[AudioEngine] noteOff voice=${voiceId}`)
+    worklet.port.postMessage({ type: 'noteOff', voiceId })
   }
 
-  const setEffectEnabled = (effectId: string, enabled: boolean) => {
-    if (effectsChainRef.current) {
-      effectsChainRef.current.setEffectEnabled(effectId, enabled)
-    }
+  const setEffectEnabled = (_effectId: string, _enabled: boolean) => {
+    // Effects disabled until audio works — stubs for API compatibility
   }
 
-  const setEffectParam = (effectId: string, param: string, value: number) => {
-    if (effectsChainRef.current) {
-      effectsChainRef.current.setEffectParam(effectId, param, value)
-    }
+  const setEffectParam = (_effectId: string, _param: string, _value: number) => {
+    // Stub
   }
 
   const setMasterVolume = (volume: number) => {
+    pendingVolume.current = volume
     if (masterGainRef.current && ctxRef.current) {
-      masterGainRef.current.gain.setValueAtTime(volume, ctxRef.current.currentTime)
+      masterGainRef.current.gain.setTargetAtTime(volume, ctxRef.current.currentTime, 0.05)
     }
   }
 
   const setPhysicalModelParams = (params: { stiffness?: number; brightness?: number; decay?: number }) => {
-    physicalParamsRef.current = { ...physicalParamsRef.current, ...params }
+    if (params.brightness !== undefined) physParams.current.brightness = params.brightness
+    if (params.decay !== undefined) physParams.current.decay = params.decay
+
+    const worklet = workletRef.current
+    if (worklet) {
+      worklet.port.postMessage({
+        type: 'setGlobalParams',
+        brightness: physParams.current.brightness,
+        decay: physParams.current.decay,
+      })
+    }
   }
 
-  return { 
-    noteOn, 
-    noteUpdate, 
+  const setVibratoDepth = (_depth: number) => {
+    // Stub — add chorus/vibrato after base sound works
+  }
+
+  return {
+    noteOn,
+    noteUpdate,
     noteOff,
     setEffectEnabled,
     setEffectParam,
     setMasterVolume,
-    setPhysicalModelParams
+    setPhysicalModelParams,
+    setVibratoDepth,
   }
 }

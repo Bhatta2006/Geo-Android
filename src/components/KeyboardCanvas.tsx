@@ -18,21 +18,190 @@ interface KeyboardCanvasProps {
   showSvara?: boolean
 }
 
+// Pre-draw a single key cell to an offscreen canvas for performance
+// Colors:
+//   root note in scale:    warm orange border + tinted bg
+//   in scale (not root):   cyan border + dark bg
+//   out of scale:          dim grey border + very dark bg
+//   pressed:               bright cyan fill + white text
+
+function drawGeoShredKey(
+  ctx: CanvasRenderingContext2D,
+  cell: KeyCell,
+  isPressed: boolean,
+  showSvara: boolean,
+) {
+  const { x, y, width: w, height: h, isInScale, isRoot, noteName, svaraName } = cell
+  const pad = 1.5 // gap between keys
+
+  const cx = x + w / 2
+  const cy = y + h / 2
+
+  // ─── Background ───
+  if (isPressed) {
+    // Pressed: strong cyan gradient
+    const g = ctx.createLinearGradient(x, y, x, y + h)
+    g.addColorStop(0, 'rgba(0,229,255,0.55)')
+    g.addColorStop(0.5, 'rgba(0,180,210,0.35)')
+    g.addColorStop(1, 'rgba(0,100,140,0.25)')
+    ctx.fillStyle = g
+  } else if (!isInScale) {
+    ctx.fillStyle = '#0a0c10'
+  } else if (isRoot) {
+    ctx.fillStyle = '#1a1000'
+  } else {
+    ctx.fillStyle = '#0e1118'
+  }
+
+  ctx.beginPath()
+  ctx.roundRect(x + pad, y + pad, w - pad * 2, h - pad * 2, 4)
+  ctx.fill()
+
+  // ─── Border ───
+  ctx.lineWidth = isPressed ? 2 : 1
+  if (isPressed) {
+    ctx.strokeStyle = '#00e5ff'
+  } else if (isRoot && isInScale) {
+    ctx.strokeStyle = 'rgba(255,140,40,0.75)'
+  } else if (isInScale) {
+    ctx.strokeStyle = 'rgba(0,229,255,0.45)'
+  } else {
+    ctx.strokeStyle = 'rgba(255,255,255,0.07)'
+  }
+
+  ctx.beginPath()
+  ctx.roundRect(x + pad, y + pad, w - pad * 2, h - pad * 2, 4)
+  ctx.stroke()
+
+  // ─── Concentric circle texture (guitar sound hole) ───
+  if (isInScale) {
+    const maxRadius = Math.min(w, h) * 0.38
+    const rings = 4
+    const baseAlpha = isPressed ? 0.35 : (isRoot ? 0.18 : 0.12)
+    const ringColor = isPressed
+      ? `rgba(255,255,255,` 
+      : isRoot
+        ? `rgba(255,160,60,`
+        : `rgba(0,229,255,`
+
+    for (let i = rings; i >= 1; i--) {
+      const r = (maxRadius / rings) * i
+      ctx.beginPath()
+      ctx.arc(cx, cy - h * 0.08, r, 0, Math.PI * 2)
+      ctx.strokeStyle = ringColor + (baseAlpha * (i / rings)).toFixed(2) + ')'
+      ctx.lineWidth = 0.8
+      ctx.stroke()
+    }
+
+    // Center dot
+    ctx.beginPath()
+    ctx.arc(cx, cy - h * 0.08, 2.5, 0, Math.PI * 2)
+    ctx.fillStyle = isPressed ? 'rgba(255,255,255,0.6)' : isRoot ? 'rgba(255,140,40,0.5)' : 'rgba(0,229,255,0.4)'
+    ctx.fill()
+  }
+
+  // ─── Note Label ───
+  const label = showSvara ? svaraName : noteName
+  const fontSize = Math.min(15, Math.max(10, h * 0.2))
+
+  if (isInScale) {
+    ctx.fillStyle = isPressed
+      ? '#ffffff'
+      : isRoot
+        ? '#ffa040'
+        : '#9ab0cc'
+  } else {
+    ctx.fillStyle = '#2a3040'
+  }
+
+  ctx.font = `700 ${fontSize}px "Outfit", "Inter", sans-serif`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'alphabetic'
+  ctx.fillText(label, cx, y + h - h * 0.18)
+
+  // ─── Pressed glow overlay ───
+  if (isPressed) {
+    const glowGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.min(w, h) * 0.5)
+    glowGrad.addColorStop(0, 'rgba(0,229,255,0.2)')
+    glowGrad.addColorStop(1, 'rgba(0,229,255,0)')
+    ctx.fillStyle = glowGrad
+    ctx.beginPath()
+    ctx.roundRect(x + pad, y + pad, w - pad * 2, h - pad * 2, 4)
+    ctx.fill()
+  }
+}
+
 export function KeyboardCanvas({ config, voiceManager, showSvara = false }: KeyboardCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const activeTouches = useRef<Map<number, TouchPoint>>(new Map())
   const layout = useRef<KeyCell[]>([])
 
-  // Re-build layout when config or window changes size
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const dpr = window.devicePixelRatio || 1
+    ctx.save()
+    ctx.scale(dpr, dpr)
+
+    const logicalW = canvas.width / dpr
+    const logicalH = canvas.height / dpr
+    ctx.clearRect(0, 0, logicalW, logicalH)
+
+    // Background
+    ctx.fillStyle = '#080a0e'
+    ctx.fillRect(0, 0, logicalW, logicalH)
+
+    // Draw all key cells
+    const pressedSet = new Set(
+      Array.from(activeTouches.current.values()).map(t => `${t.cell.row},${t.cell.col}`)
+    )
+
+    for (const cell of layout.current) {
+      const isPressed = pressedSet.has(`${cell.row},${cell.col}`)
+      drawGeoShredKey(ctx, cell, isPressed, showSvara)
+    }
+
+    // Touch ripple indicators
+    for (const touch of activeTouches.current.values()) {
+      const rect = canvas.getBoundingClientRect()
+      const tx = touch.clientX - rect.left
+      const ty = touch.clientY - rect.top
+
+      const glow = ctx.createRadialGradient(tx, ty, 2, tx, ty, 36)
+      glow.addColorStop(0, 'rgba(0, 229, 255, 0.5)')
+      glow.addColorStop(0.5, 'rgba(0, 229, 255, 0.15)')
+      glow.addColorStop(1, 'rgba(0, 229, 255, 0)')
+      ctx.fillStyle = glow
+      ctx.beginPath()
+      ctx.arc(tx, ty, 36, 0, Math.PI * 2)
+      ctx.fill()
+
+      // Inner dot
+      ctx.beginPath()
+      ctx.arc(tx, ty, 6, 0, Math.PI * 2)
+      ctx.fillStyle = 'rgba(255,255,255,0.9)'
+      ctx.fill()
+      ctx.strokeStyle = '#00e5ff'
+      ctx.lineWidth = 2
+      ctx.stroke()
+    }
+
+    ctx.restore()
+  }, [showSvara])
+
   const updateLayout = useCallback(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     const rect = canvas.getBoundingClientRect()
-    canvas.width = rect.width * window.devicePixelRatio
-    canvas.height = rect.height * window.devicePixelRatio
-    layout.current = buildLayout(config, canvas.width / window.devicePixelRatio)
+    const dpr = window.devicePixelRatio || 1
+    canvas.width = rect.width * dpr
+    canvas.height = rect.height * dpr
+    layout.current = buildLayout(config, rect.width, rect.height)
     draw()
-  }, [config])
+  }, [config, draw])
 
   useEffect(() => {
     updateLayout()
@@ -47,107 +216,12 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
     ) ?? null
   }
 
-  const draw = useCallback(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-
-    const dpr = window.devicePixelRatio
-    ctx.save()
-    ctx.scale(dpr, dpr)
-    ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr)
-
-    // Draw grid keys
-    for (const cell of layout.current) {
-      const isPressed = Array.from(activeTouches.current.values()).some(
-        touch => touch.cell.row === cell.row && touch.cell.col === cell.col
-      )
-
-      // Background fill color logic
-      if (isPressed) {
-        // Glowing cyan gradient for pressed key
-        const grad = ctx.createLinearGradient(cell.x, cell.y, cell.x, cell.y + cell.height)
-        grad.addColorStop(0, '#00e5ff')
-        grad.addColorStop(1, '#00838f')
-        ctx.fillStyle = grad
-      } else if (!cell.isInScale) {
-        ctx.fillStyle = '#11111e'      // darkened out-of-scale key
-      } else if (cell.isRoot) {
-        ctx.fillStyle = '#2c220f'      // subtle gold/brown background for root note
-      } else {
-        ctx.fillStyle = '#1c1c2e'      // default dark slate for in-scale keys
-      }
-
-      ctx.fillRect(cell.x + 1, cell.y + 1, cell.width - 2, cell.height - 2)
-
-      // Key cell border
-      ctx.strokeStyle = cell.isRoot && cell.isInScale
-        ? '#ffd700' 
-        : cell.isInScale ? '#3a3a5e' : '#1d1d2b'
-      ctx.lineWidth = cell.isRoot && cell.isInScale ? 1.5 : 1
-      ctx.strokeRect(cell.x + 0.5, cell.y + 0.5, cell.width - 1, cell.height - 1)
-
-      // Center dots for quarter-tones/visual alignment (Polkadot style indicator)
-      if (cell.isInScale) {
-        ctx.fillStyle = cell.isRoot ? '#ffd700' : '#4f4f7a'
-        ctx.beginPath()
-        ctx.arc(cell.x + cell.width / 2, cell.y + cell.height - 10, 3, 0, Math.PI * 2)
-        ctx.fill()
-      }
-
-      // Draw Note Label
-      if (cell.isInScale) {
-        ctx.fillStyle = isPressed 
-          ? '#ffffff' 
-          : cell.isRoot ? '#ffd700' : '#b0b0d6'
-      } else {
-        ctx.fillStyle = '#44445c'      // dim out-of-scale text
-      }
-
-      const fontSize = Math.min(16, cell.height * 0.22)
-      ctx.font = `bold ${fontSize}px "Outfit", "Inter", sans-serif`
-      ctx.textAlign = 'center'
-      ctx.textBaseline = 'middle'
-
-      const label = showSvara ? cell.svaraName : cell.noteName
-      ctx.fillText(label, cell.x + cell.width / 2, cell.y + cell.height / 2)
-    }
-
-    // Draw Touch Indicator Circles & Trailing Lines
-    for (const touch of activeTouches.current.values()) {
-      const rect = canvas.getBoundingClientRect()
-      const x = touch.clientX - rect.left
-      const y = touch.clientY - rect.top
-
-      // Draw soft outer radial glow
-      const glow = ctx.createRadialGradient(x, y, 2, x, y, 40)
-      glow.addColorStop(0, 'rgba(0, 229, 255, 0.4)')
-      glow.addColorStop(1, 'rgba(0, 229, 255, 0)')
-      ctx.fillStyle = glow
-      ctx.beginPath()
-      ctx.arc(x, y, 40, 0, Math.PI * 2)
-      ctx.fill()
-
-      // Draw solid inner pointer core
-      ctx.fillStyle = '#ffffff'
-      ctx.strokeStyle = '#00e5ff'
-      ctx.lineWidth = 3
-      ctx.beginPath()
-      ctx.arc(x, y, 12, 0, Math.PI * 2)
-      ctx.fill()
-      ctx.stroke()
-    }
-
-    ctx.restore()
-  }, [showSvara])
-
-  // Custom draw caller that uses requestAnimationFrame
   const requestRedraw = useCallback(() => {
     requestAnimationFrame(draw)
   }, [draw])
 
   const handlePointerDown = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
+    e.preventDefault()
     e.currentTarget.setPointerCapture(e.pointerId)
     const rect = e.currentTarget.getBoundingClientRect()
     const x = e.clientX - rect.left
@@ -155,8 +229,8 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
     const cell = hitTest(x, y)
     if (!cell) return
 
-    const keyX = (x - cell.x) / cell.width   // 0–1 horizontal within key
-    const keyY = 1 - (y - cell.y) / cell.height // 0=bottom, 1=top
+    const keyX = (x - cell.x) / cell.width
+    const keyY = 1 - (y - cell.y) / cell.height
     const keyZ = e.pressure > 0 && e.pressure < 1 ? e.pressure : 0.5
 
     activeTouches.current.set(e.pointerId, {
@@ -190,14 +264,12 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
     const rect = e.currentTarget.getBoundingClientRect()
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
-    
-    // Check if finger moved onto a different key cell (for active highlighting)
+
     const cell = hitTest(x, y)
     if (cell && (cell.row !== touch.cell.row || cell.col !== touch.cell.col)) {
       touch.cell = cell
     }
 
-    // Calculate delta relative to initial start coordinates
     const dx = x - touch.initialX
     const centsOffset = (dx / touch.initialCell.width) * 100
 
@@ -228,7 +300,6 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
         display: 'block',
         width: '100%',
         height: '100%',
-        backgroundColor: '#0c0c14',
         userSelect: 'none',
         WebkitUserSelect: 'none',
       }}

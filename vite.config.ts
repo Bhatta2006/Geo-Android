@@ -17,8 +17,4 @@ export default defineConfig({
       }
     })
   ],
-  worker: {
-    format: 'es',         // AudioWorklet needs ES module format
-  },
 })
-

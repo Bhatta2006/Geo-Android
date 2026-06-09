@@ -25,10 +25,15 @@ export interface LayoutConfig {
 export const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 export const SVARA_NAMES = ['Sa', 'Re♭', 'Re', 'Ga♭', 'Ga', 'Ma', 'Ma#', 'Pa', 'Dha♭', 'Dha', 'Ni♭', 'Ni']
 
-export function buildLayout(config: LayoutConfig, canvasWidth: number): KeyCell[] {
+export function buildLayout(config: LayoutConfig, canvasWidth: number, canvasHeight?: number): KeyCell[] {
   const cells: KeyCell[] = []
   // Auto-fill width with columns, add extra 2 columns to ensure grid covers past the right edge
   const cols = Math.ceil(canvasWidth / config.keyWidth) + 2
+
+  // Compute key height dynamically from canvas height if provided
+  const keyH = canvasHeight
+    ? Math.floor(canvasHeight / config.rows)
+    : config.keyHeight
 
   for (let row = 0; row < config.rows; row++) {
     // Calculate starting note of this row based on cumulative row intervals
@@ -42,20 +47,19 @@ export function buildLayout(config: LayoutConfig, canvasWidth: number): KeyCell[
       if (midiNote < 0 || midiNote > 127) continue
 
       const noteClass = midiNote % 12
-      const octave = Math.floor(midiNote / 12) - 1
 
       cells.push({
         row,
         col,
         midiNote,
-        noteName: NOTE_NAMES[noteClass] + octave,
+        noteName: NOTE_NAMES[noteClass],   // just letter, no octave suffix
         svaraName: SVARA_NAMES[noteClass],
         isRoot: noteClass === config.rootNote,
         isInScale: config.scale.includes(noteClass),
         x: col * config.keyWidth,
-        y: (config.rows - 1 - row) * config.keyHeight, // row 0 at bottom, row N-1 at top
+        y: (config.rows - 1 - row) * keyH, // row 0 at bottom, row N-1 at top
         width: config.keyWidth,
-        height: config.keyHeight,
+        height: keyH,
       })
     }
   }
