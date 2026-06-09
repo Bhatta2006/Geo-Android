@@ -15,6 +15,8 @@ interface Voice {
   roundingSpeed: number;        // rate of convergence to target
   velocity: number;             // attack velocity (excitation volume)
   lastFilteredSample: number;   // state for one-pole lowpass filter
+  releasing: boolean;           // release phase tracking
+  releaseSamplesRemaining: number;
 }
 
 class KarplusStrongProcessor extends AudioWorkletProcessor {
@@ -70,7 +72,9 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
       targetPitchCents: 0,
       roundingSpeed: 0.15,
       velocity,
-      lastFilteredSample: 0
+      lastFilteredSample: 0,
+      releasing: false,
+      releaseSamplesRemaining: 0
     });
   }
 
@@ -89,11 +93,8 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
     
     // Smoothly decay string instead of immediate cut
     voice.loopGain *= 0.8;
-    
-    // Cleanup reference after 2 seconds
-    setTimeout(() => {
-      this.voices.delete(voiceId);
-    }, 2000);
+    voice.releasing = true;
+    voice.releaseSamplesRemaining = 2 * this.sampleRate; // 2 seconds of decay
   }
 
   // Lagrange 3rd-order fractional delay interpolation
@@ -127,8 +128,17 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
     // Zero out output buffer
     output.fill(0);
 
-    for (const [, voice] of this.voices) {
+    for (const [voiceId, voice] of this.voices) {
       if (!voice.active) continue;
+
+      // Check decay status for releasing voices
+      if (voice.releasing) {
+        voice.releaseSamplesRemaining -= output.length;
+        if (voice.releaseSamplesRemaining <= 0) {
+          this.voices.delete(voiceId);
+          continue;
+        }
+      }
 
       // Exponential convergence of pitch bend cents toward target (continuous Pitch Rounding)
       const bendError = voice.targetPitchCents - voice.currentPitchCents;
