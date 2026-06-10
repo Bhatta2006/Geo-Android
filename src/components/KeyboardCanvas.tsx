@@ -3,6 +3,7 @@ import { type KeyCell, type LayoutConfig, buildLayout } from '../engine/keyboard
 import { type VoiceManager } from '../engine/audio/VoiceManager'
 import { useKeyboardGesture } from '../hooks/useKeyboardGesture'
 import { KeyboardRenderer, type ActiveVoiceInfo } from '../engine/renderer/KeyboardRenderer'
+import { type AudioEngine } from '../engine/audio/useAudioEngine'
 
 interface TouchPoint {
   pointerId: number
@@ -19,9 +20,11 @@ interface KeyboardCanvasProps {
   config: LayoutConfig
   voiceManager: VoiceManager
   showSvara?: boolean
+  /** Reference to the audio engine so we can unlock AudioContext on first touch */
+  audioEngine: AudioEngine
 }
 
-export function KeyboardCanvas({ config, voiceManager, showSvara = false }: KeyboardCanvasProps) {
+export function KeyboardCanvas({ config, voiceManager, showSvara = false, audioEngine }: KeyboardCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const activeTouches = useRef<Map<number, TouchPoint>>(new Map())
   const layout = useRef<KeyCell[]>([])
@@ -152,6 +155,10 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
   return (
     <canvas
       ref={canvasRef}
+      // onPointerDown fires SYNCHRONOUSLY before use-gesture's drag handler.
+      // Calling unlockAudio() here is the ONLY reliable way to unlock
+      // AudioContext inside the browser's user-gesture window.
+      onPointerDown={() => audioEngine.unlockAudio()}
       style={{
         touchAction: 'none',
         display: 'block',

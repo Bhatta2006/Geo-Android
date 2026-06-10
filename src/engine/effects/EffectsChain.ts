@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // Pure Web Audio API effects chain — no Tone.js dependency.
 // Tone.js creates its own AudioContext which breaks our worklet signal path.
 import Tuna from 'tunajs'

@@ -41,15 +41,28 @@ export interface Setlist {
   presets: { presetId: string; name: string }[]
 }
 
+export interface SavedSample {
+  id: string
+  name: string
+  data: ArrayBuffer
+  rootMidiNote: number
+}
+
 class GeoShredDB extends Dexie {
   presets!: Dexie.Table<Preset, string>
   setlists!: Dexie.Table<Setlist, string>
+  samples!: Dexie.Table<SavedSample, string>
 
   constructor() {
     super('GeoShredWeb')
     this.version(1).stores({
       presets: 'id, name, color',
       setlists: 'id, name',
+    })
+    this.version(2).stores({
+      presets: 'id, name, color',
+      setlists: 'id, name',
+      samples: 'id, name',
     })
   }
 }
