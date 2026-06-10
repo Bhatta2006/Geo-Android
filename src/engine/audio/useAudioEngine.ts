@@ -33,6 +33,8 @@ export interface AudioEngine {
   setVibratoDepth: (depth: number) => void
   setInstrumentParams: (params: { type: string; jawariAmount?: number; jawariThreshold?: number }) => void
   setSympatheticParams: (scaleDegrees: number[], rootMidi: number, gain: number, decay: number) => void
+  /** Expose the underlying AudioContext so external engines (SampleEngine) can share it */
+  getAudioContext: () => AudioContext | null
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -266,6 +268,10 @@ class AudioEngineImpl implements AudioEngine {
         sympatheticDecay: decay,
       })
     }
+  }
+
+  getAudioContext(): AudioContext | null {
+    return this.ctx
   }
 
   setVibratoDepth(_depth: number): void {

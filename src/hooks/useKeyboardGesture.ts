@@ -1,5 +1,5 @@
 import { useDrag } from '@use-gesture/react'
-import { type KeyCell } from '../engine/keyboard/KeyboardLayout'
+import { type KeyCell, pointInHex } from '../engine/keyboard/KeyboardLayout'
 import { type VoiceManager } from '../engine/audio/VoiceManager'
 
 interface TouchPoint {
@@ -50,11 +50,7 @@ export function useKeyboardGesture({
 }: UseKeyboardGestureOptions) {
   const hitTest = (x: number, y: number): KeyCell | null =>
     (layoutRef.current || []).find(
-      (cell) =>
-        x >= cell.x &&
-        x < cell.x + cell.width &&
-        y >= cell.y &&
-        y < cell.y + cell.height
+      (cell) => pointInHex(x, y, cell.centerX, cell.centerY, cell.hexRadius)
     ) ?? null
 
   useDrag(

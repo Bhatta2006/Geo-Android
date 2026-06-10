@@ -1,4 +1,5 @@
 import type { AudioEngine } from './useAudioEngine'
+import { type SampleEngine } from './SampleEngine'
 import { SlideEngine, type SlideEngineConfig } from '../pitch/SlideEngine'
 
 export interface TouchState {
@@ -36,6 +37,12 @@ export class VoiceManager {
 
   private nextVoiceId = 1
 
+  /** Optional SampleEngine for user-uploaded sample playback */
+  private sampleEngine: SampleEngine | null = null
+  private sampleMode = false
+  /** Track which voiceId maps to which midiNote for sample pitch bending */
+  private voiceMidiMap = new Map<number, number>()
+
   constructor(
     audioEngine: AudioEngine,
     playMode: 'mono' | 'string' | 'poly' = 'string',
@@ -55,6 +62,16 @@ export class VoiceManager {
 
   setConfig(config: Partial<VoiceManagerConfig>): void {
     this.slideEngine.updateConfig(this.buildSlideConfig(config))
+  }
+
+  /** Attach a SampleEngine for user-uploaded sample playback */
+  setSampleEngine(engine: SampleEngine | null): void {
+    this.sampleEngine = engine
+  }
+
+  /** Toggle between KS synthesis and sample playback */
+  setSampleMode(enabled: boolean): void {
+    this.sampleMode = enabled
   }
 
   handleTouchDown(touch: TouchState): void {
@@ -134,6 +151,15 @@ export class VoiceManager {
     })
 
     this.audioEngine.noteUpdate(voiceId, pitchBendCents, params.keyY, params.keyZ)
+
+    // Also update sample engine pitch if in sample mode
+    if (this.sampleMode && this.sampleEngine) {
+      const baseMidi = this.voiceMidiMap.get(voiceId)
+      if (baseMidi !== undefined) {
+        this.sampleEngine.noteUpdate(voiceId, baseMidi, pitchBendCents)
+      }
+    }
+
     return pitchBendCents
   }
 
@@ -144,7 +170,11 @@ export class VoiceManager {
     if (voiceId !== undefined) this.slideEngine.clearVoice(voiceId)
 
     if (this.playMode !== 'string') {
-      if (voiceId !== undefined) this.audioEngine.noteOff(voiceId)
+      if (voiceId !== undefined) {
+        this.audioEngine.noteOff(voiceId)
+        if (this.sampleMode && this.sampleEngine) this.sampleEngine.noteOff(voiceId)
+        this.voiceMidiMap.delete(voiceId)
+      }
       return
     }
 
@@ -159,11 +189,19 @@ export class VoiceManager {
       const remaining = rowList[rowList.length - 1]
       if (voiceId !== undefined) {
         this.pointerToVoice.set(remaining.pointerId, voiceId)
+        this.voiceMidiMap.set(voiceId, remaining.midiNote)
         this.slideEngine.initVoice(voiceId, remaining.midiNote, remaining.keyX)
         this.audioEngine.noteOn(voiceId, remaining.midiNote, remaining.keyX, remaining.keyY, remaining.keyZ)
+        if (this.sampleMode && this.sampleEngine?.isLoaded) {
+          this.sampleEngine.noteOn(voiceId, remaining.midiNote, remaining.keyZ)
+        }
       }
     } else {
-      if (voiceId !== undefined) this.audioEngine.noteOff(voiceId)
+      if (voiceId !== undefined) {
+        this.audioEngine.noteOff(voiceId)
+        if (this.sampleMode && this.sampleEngine) this.sampleEngine.noteOff(voiceId)
+        this.voiceMidiMap.delete(voiceId)
+      }
     }
   }
 
@@ -188,8 +226,14 @@ export class VoiceManager {
   ): void {
     const voiceId = this.nextVoiceId++
     this.pointerToVoice.set(pointerId, voiceId)
+    this.voiceMidiMap.set(voiceId, midiNote)
     this.slideEngine.initVoice(voiceId, midiNote, keyX)
     this.audioEngine.noteOn(voiceId, midiNote, keyX, keyY, keyZ)
+
+    // Trigger sample engine if in sample mode
+    if (this.sampleMode && this.sampleEngine?.isLoaded) {
+      this.sampleEngine.noteOn(voiceId, midiNote, keyZ)
+    }
   }
 
   private buildSlideConfig(patch?: Partial<VoiceManagerConfig>): SlideEngineConfig {

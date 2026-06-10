@@ -97,7 +97,6 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false, audioE
 
   const requestRedraw = useCallback(() => {
     // No-op: the RAF loop handles continuous drawing.
-    // We keep this for API compatibility with useKeyboardGesture.
   }, [])
 
   const onTouchDown = useCallback(
@@ -115,30 +114,9 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false, audioE
     []
   )
 
-  const onTouchMove = useCallback(
-    (
-      pointerId: number,
-      clientX: number,
-      clientY: number,
-      pitchBendCents: number
-    ) => {
-      const canvas = canvasRef.current
-      if (!canvas) return
-
-      const rect = canvas.getBoundingClientRect()
-      const x = clientX - rect.left
-      const y = clientY - rect.top
-
-      // Feed the current pointer position into the pitch trail for this voice
-      const touch = activeTouches.current.get(pointerId)
-      const isRoot = touch?.initialCell.isRoot ?? false
-      rendererRef.current.addTrailPoint(pointerId, x, y, pitchBendCents, isRoot)
-    },
-    []
-  )
-
-  const onTouchUp = useCallback((pointerId: number) => {
-    rendererRef.current.clearTrail(pointerId)
+  // No trail — just pass onTouchMove as undefined (no trail lines)
+  const onTouchUp = useCallback((_pointerId: number) => {
+    // No trail to clear — this is just a stub for API compatibility
   }, [])
 
   useKeyboardGesture({
@@ -148,7 +126,7 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false, audioE
     activeTouchesRef: activeTouches,
     requestRedraw,
     onTouchDown,
-    onTouchMove,
+    onTouchMove: undefined,  // No trail lines
     onTouchUp,
   })
 

@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { KeyboardCanvas } from './components/KeyboardCanvas'
 import { useAudioEngine } from './engine/audio/useAudioEngine'
 import { VoiceManager } from './engine/audio/VoiceManager'
 import { DroneEngine } from './engine/audio/DroneEngine'
+import { SampleEngine } from './engine/audio/SampleEngine'
 import { db, type Preset as DbPreset } from './presets/PresetSchema'
 import type { LayoutConfig } from './engine/keyboard/KeyboardLayout'
 
@@ -80,7 +81,7 @@ const FACTORY_PRESETS: Preset[] = [
     vibValue: 0.1,
     dampingValue: 0.3,
     instrumentType: 'veena_sitar',
-    jawariAmount: 0.65,      // sitar-level buzz (plan: 0.6–0.8)
+    jawariAmount: 0.65,
     jawariThreshold: 0.15,
     sympatheticGain: 0.2,
     sympatheticDecay: 0.9985,
@@ -109,28 +110,28 @@ const FACTORY_PRESETS: Preset[] = [
     sympatheticDecay: 0.998,
   },
   {
-    // Xitar 1.5 — Mahesh Raghavan style (exact parameters from Phase2.md §5.4)
+    // Xitar 1.5 — Mahesh Raghavan style
     id: 'xitar-mahesh',
     name: 'Xitar 1.5',
     rows: 4,
-    startMidiNote: 48,             // C3
-    scaleName: 'kharaharapriya',   // Kharaharapriya = plan §5.4 scale
+    startMidiNote: 48,
+    scaleName: 'kharaharapriya',
     scale: SCALES.kharaharapriya.degrees,
-    rootNote: 0,                   // C
+    rootNote: 0,
     snapEnabled: true,
     roundEnabled: true,
-    slideSpeed: 0.05,              // §5.4 slideSpeed
+    slideSpeed: 0.05,
     diatonicEnabled: true,
     volValue: 0.78,
     vibValue: 0.05,
     dampingValue: 0.2,
     instrumentType: 'veena_sitar',
-    jawariAmount: 0.45,            // §5.4 jawariAmount
-    jawariThreshold: 0.18,         // §5.4 jawariThreshold
-    sympatheticGain: 0.25,         // §5.4 sympatheticGain
-    sympatheticDecay: 0.9985,      // §5.4 sympatheticDecay
-    decayOverride: 0.99998,         // §5.4 decay — very long sustain for slides
-    brightnessOverride: 0.88,      // §5.4 brightness
+    jawariAmount: 0.45,
+    jawariThreshold: 0.18,
+    sympatheticGain: 0.25,
+    sympatheticDecay: 0.9985,
+    decayOverride: 0.99998,
+    brightnessOverride: 0.88,
   },
 ]
 
@@ -148,8 +149,18 @@ export default function App() {
   const [droneOn, setDroneOn] = useState<boolean>(false)
   const [isVeenaMode, setIsVeenaMode] = useState<boolean>(false)
 
+  // Drawer state
+  const [drawerOpen, setDrawerOpen] = useState<boolean>(false)
+
+  // Sample engine state
+  const [sampleLoaded, setSampleLoaded] = useState<boolean>(false)
+  const [sampleName, setSampleName] = useState<string>('')
+  const [useSampleMode, setUseSampleMode] = useState<boolean>(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
   const voiceManager = useMemo(() => new VoiceManager(audioEngine, 'string'), [audioEngine])
   const droneEngine = useMemo(() => new DroneEngine(audioEngine), [audioEngine])
+  const sampleEngine = useMemo(() => new SampleEngine(), [])
 
   const activePreset = presets[activePresetIndex]
 
@@ -229,13 +240,38 @@ export default function App() {
     syncDb()
   }, [])
 
+  // Initialize SampleEngine when AudioContext becomes available
+  useEffect(() => {
+    const ctx = audioEngine.getAudioContext()
+    if (ctx) {
+      sampleEngine.setContext(ctx)
+    }
+  }, [audioEngine, sampleEngine])
 
+  // Re-init sample engine context on every unlock (in case ctx was created late)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const ctx = audioEngine.getAudioContext()
+      if (ctx && !sampleEngine.isLoaded) {
+        sampleEngine.setContext(ctx)
+      }
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [audioEngine, sampleEngine])
+
+  // Wire sample engine into voice manager
+  useEffect(() => {
+    voiceManager.setSampleEngine(sampleEngine)
+  }, [voiceManager, sampleEngine])
+
+  // Sync sample mode toggle
+  useEffect(() => {
+    voiceManager.setSampleMode(useSampleMode && sampleLoaded)
+  }, [voiceManager, useSampleMode, sampleLoaded])
 
   useEffect(() => {
     const mode = playMode === 'String' ? 'string' : playMode === 'Poly' ? 'poly' : 'mono'
     voiceManager.setPlayMode(mode)
-    // Pass actual layout startMidiNote+octave and rowIntervals so SlideEngine
-    // pitch math stays in sync with the key cells that are rendered.
     const effectiveStartMidi = activePreset.startMidiNote + (octave - 2) * 12
     const effectiveRowIntervals = activePreset.rows === 6 ? [5, 5, 5, 4, 5] : [5]
     voiceManager.setConfig({
@@ -255,11 +291,7 @@ export default function App() {
   }, [audioEngine, activePreset.volValue])
 
   useEffect(() => {
-    // Decay formula: per-sample loopGain. Must be very close to 1 for audible sustain.
-    // 0.99996 ≈ 3.5s sustain, 0.99998 ≈ 7s sustain.
-    // Old formula (0.998 - damp*0.015) gave loopGain≈0.993 which killed notes in ~50ms.
     const baseDecay = activePreset.decayOverride ?? (0.99996 - activePreset.dampingValue * 0.0001)
-    // Veena mode forces longer sustain for expressive slides
     const decay = isVeenaMode ? Math.max(baseDecay, 0.99998) : baseDecay
     const brightness = activePreset.brightnessOverride ?? (0.3 + (1 - activePreset.dampingValue) * 0.5)
     audioEngine.setPhysicalModelParams({ decay, brightness })
@@ -269,9 +301,8 @@ export default function App() {
     audioEngine.setVibratoDepth(activePreset.vibValue)
   }, [audioEngine, activePreset.vibValue])
 
-  // Wire instrument type (jawari) + sympathetic parameters to worklet on preset change
+  // Wire instrument type (jawari) + sympathetic parameters
   useEffect(() => {
-    // Veena toggle overrides the preset's instrument type
     const instrumentType = isVeenaMode ? 'veena_sitar' : activePreset.instrumentType
     const jawariAmount = isVeenaMode ? 0.45 : activePreset.jawariAmount
     const jawariThreshold = isVeenaMode ? 0.18 : activePreset.jawariThreshold
@@ -281,7 +312,7 @@ export default function App() {
       jawariAmount,
       jawariThreshold,
     })
-    // Enable sympathetic strings when in veena/sitar mode
+
     const useVeena = instrumentType === 'veena_sitar'
     const scale = useVeena
       ? (isDiatonic ? activePreset.scale : SCALES.chromatic.degrees)
@@ -314,13 +345,12 @@ export default function App() {
     }
   }, [audioEngine, activePreset.id])
 
-  // Slider drag handler
+  // Slider drag handler (horizontal sliders now)
   const updatePresetValue = useCallback(async (key: 'volValue' | 'vibValue' | 'dampingValue', val: number) => {
     setPresets(prev => prev.map((p, idx) =>
       idx === activePresetIndex ? { ...p, [key]: val } : p
     ))
 
-    // Immediately apply to audio engine
     if (key === 'volValue') {
       audioEngine.setMasterVolume(val)
     } else if (key === 'vibValue') {
@@ -342,7 +372,8 @@ export default function App() {
     }
   }, [audioEngine, activePresetIndex, presets, isVeenaMode])
 
-  const handleSliderDrag = useCallback((
+  // Horizontal slider drag handler
+  const handleHSliderDrag = useCallback((
     e: React.PointerEvent,
     key: 'volValue' | 'vibValue' | 'dampingValue'
   ) => {
@@ -352,7 +383,7 @@ export default function App() {
 
     const updateValue = (evt: PointerEvent | React.PointerEvent) => {
       const rect = track.getBoundingClientRect()
-      let val = 1 - (evt.clientY - rect.top) / rect.height
+      let val = (evt.clientX - rect.left) / rect.width
       val = Math.max(0, Math.min(1, val))
       updatePresetValue(key, val)
     }
@@ -379,7 +410,6 @@ export default function App() {
       droneEngine.stop()
       setDroneOn(false)
     } else {
-      // Root MIDI = startMidiNote + rootNote + octave offset
       const rootMidi = activePreset.startMidiNote + activePreset.rootNote + (octave - 2) * 12
       droneEngine.start(rootMidi)
       setDroneOn(true)
@@ -400,7 +430,6 @@ export default function App() {
   }, [droneEngine])
 
   // Re-unlock AudioContext when page becomes visible again
-  // (iOS / Chrome suspend audio when the tab is backgrounded)
   useEffect(() => {
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
@@ -410,6 +439,33 @@ export default function App() {
     document.addEventListener('visibilitychange', onVisibilityChange)
     return () => document.removeEventListener('visibilitychange', onVisibilityChange)
   }, [audioEngine])
+
+  // Sample upload handler
+  const handleSampleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    // Ensure AudioContext exists
+    audioEngine.unlockAudio()
+    // Wait a tick for context to be created
+    await new Promise(r => setTimeout(r, 100))
+
+    const ctx = audioEngine.getAudioContext()
+    if (ctx) {
+      sampleEngine.setContext(ctx)
+    }
+
+    try {
+      await sampleEngine.loadSample(file)
+      setSampleLoaded(true)
+      setSampleName(file.name)
+      console.log(`[App] Sample loaded: ${file.name}`)
+    } catch (err) {
+      console.error('Failed to load sample:', err)
+      setSampleLoaded(false)
+      setSampleName('')
+    }
+  }, [audioEngine, sampleEngine])
 
   // Layout config
   const layoutConfig: LayoutConfig = {
@@ -422,161 +478,145 @@ export default function App() {
     scale: isDiatonic ? activePreset.scale : SCALES.chromatic.degrees,
   }
 
+  // ─── Render Helpers ─────────────────────────────────────────────────────────
+
+  const renderSlider = (
+    key: 'volValue' | 'vibValue' | 'dampingValue',
+    label: string,
+    val: number
+  ) => (
+    <div className="gs-slider-row" key={key}>
+      <span className="gs-slider-label">{label}</span>
+      <div
+        className="gs-slider-track"
+        id={`slider-${key}`}
+        onPointerDown={(e) => handleHSliderDrag(e, key)}
+      >
+        <div className="gs-slider-fill" style={{ width: `${val * 100}%` }} />
+        <div className="gs-slider-handle" style={{ left: `${val * 100}%` }} />
+      </div>
+      <span className="gs-slider-value">{Math.round(val * 100)}</span>
+    </div>
+  )
+
   return (
     <div className="gs-app">
-      {/* ═══ TOP TOOLBAR ═══ */}
-      <header className="gs-toolbar">
+      {/* ═══ HAMBURGER MENU BUTTON ═══ */}
+      <button
+        className={`gs-menu-btn ${drawerOpen ? 'gs-menu-open' : ''}`}
+        onClick={() => setDrawerOpen(v => !v)}
+        aria-label={drawerOpen ? 'Close settings' : 'Open settings'}
+      >
+        {drawerOpen ? '✕' : '☰'}
+      </button>
 
-        {/* Octave Selector */}
-        <div className="gs-octave-group">
-          <div className="gs-octave-label">Octave</div>
-          <div className="gs-octave-controls">
+      {/* ═══ BACKDROP ═══ */}
+      <div
+        className={`gs-backdrop ${drawerOpen ? 'gs-backdrop-visible' : ''}`}
+        onClick={() => setDrawerOpen(false)}
+      />
+
+      {/* ═══ SETTINGS DRAWER ═══ */}
+      <div className={`gs-drawer ${drawerOpen ? 'gs-drawer-open' : ''}`}>
+        <div className="gs-drawer-header">
+          <span className="gs-drawer-title">Settings</span>
+          <button className="gs-drawer-close" onClick={() => setDrawerOpen(false)}>✕</button>
+        </div>
+
+        {/* Instrument Toggle */}
+        <div className="gs-drawer-section">
+          <div className="gs-section-title">Instrument</div>
+          <div className="gs-instrument-row">
+            <button
+              className={`gs-instrument-btn ${!isVeenaMode && !useSampleMode ? 'gs-instrument-active' : ''}`}
+              onClick={() => { setIsVeenaMode(false); setUseSampleMode(false) }}
+            >🎸 Guitar</button>
+            <button
+              className={`gs-instrument-btn ${isVeenaMode && !useSampleMode ? 'gs-instrument-active' : ''}`}
+              onClick={() => { setIsVeenaMode(true); setUseSampleMode(false) }}
+            >🪕 Veena</button>
+            <button
+              className={`gs-instrument-btn ${useSampleMode ? 'gs-instrument-active' : ''}`}
+              onClick={() => { if (sampleLoaded) setUseSampleMode(true) }}
+              style={{ opacity: sampleLoaded ? 1 : 0.4 }}
+            >🎵 Sample</button>
+          </div>
+        </div>
+
+        {/* Sample Upload */}
+        <div className="gs-drawer-section">
+          <div className="gs-section-title">User Sample (C4 Note)</div>
+          <div className="gs-sample-upload">
+            <button
+              className={`gs-sample-btn ${sampleLoaded ? 'gs-sample-loaded' : ''}`}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              {sampleLoaded ? `✓ ${sampleName}` : '+ Upload C4 Sample'}
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="audio/*"
+              onChange={handleSampleUpload}
+              style={{ display: 'none' }}
+            />
+            <div className="gs-sample-hint">
+              Upload a WAV/MP3 of a single C4 note. All other notes will be pitch-shifted from it.
+            </div>
+          </div>
+        </div>
+
+        {/* Octave */}
+        <div className="gs-drawer-section">
+          <div className="gs-section-title">Octave</div>
+          <div className="gs-octave-row">
             <button
               className="gs-octave-btn"
               onClick={() => setOctave(o => Math.max(0, o - 1))}
-              aria-label="Decrease octave"
             >‹</button>
             <span className="gs-octave-value">{octave}</span>
             <button
               className="gs-octave-btn"
               onClick={() => setOctave(o => Math.min(6, o + 1))}
-              aria-label="Increase octave"
             >›</button>
           </div>
-          <div className="gs-auto-label">Auto</div>
         </div>
 
-        {/* Expression / XY Pad */}
-        <div className="gs-expr-group">
-          <div className="gs-expr-label-row">
-            <span className="gs-expr-title">Expression</span>
-          </div>
-          <div className="gs-expr-inner">
-            {/* Circular XY pad */}
-            <div className="gs-xy-container">
-              <div className="gs-xy-labels">
-                <span className="gs-xy-label-v">Guitar/Feedback</span>
-              </div>
-              <div className="gs-xy-pad" id="xy-pad">
-                <div className="gs-xy-crosshair" style={{ left: '50%', top: '50%' }} />
-                <div className="gs-xy-rings" />
-              </div>
-              <div className="gs-xy-label-h">Guitar/Distance</div>
-            </div>
-
-            {/* Vertical Sliders: Fret Excitation, Whammy, Vibrato, Depth, Filter */}
-            {[
-              { key: 'volValue' as const, label: 'Fret\nExcitation', val: activePreset.volValue, color: '#00e5ff' },
-              { key: 'vibValue' as const, label: 'Whammy', val: activePreset.vibValue, color: '#ff6b35' },
-              { key: 'dampingValue' as const, label: 'Vibrato\nDepth', val: activePreset.vibValue, color: '#00e5ff' },
-            ].map(({ key, label, val, color }) => (
-              <div className="gs-vslider-group" key={key}>
-                <div className="gs-vslider-label">{label}</div>
-                <div
-                  className="gs-vslider-track"
-                  id={`slider-${key}`}
-                  onPointerDown={(e) => handleSliderDrag(e, key)}
-                >
-                  <div
-                    className="gs-vslider-fill"
-                    style={{ height: `${val * 100}%`, background: color }}
-                  />
-                  <div
-                    className="gs-vslider-handle"
-                    style={{ bottom: `calc(${val * 100}% - 6px)`, borderColor: color }}
-                  />
-                </div>
-              </div>
-            ))}
-
-            {/* Filter slider (damping) */}
-            <div className="gs-vslider-group">
-              <div className="gs-vslider-label">Filter</div>
-              <div
-                className="gs-vslider-track"
-                id="slider-filter"
-                onPointerDown={(e) => handleSliderDrag(e, 'dampingValue')}
-              >
-                <div
-                  className="gs-vslider-fill"
-                  style={{ height: `${activePreset.dampingValue * 100}%`, background: '#4fc3f7' }}
-                />
-                <div
-                  className="gs-vslider-handle"
-                  style={{ bottom: `calc(${activePreset.dampingValue * 100}% - 6px)`, borderColor: '#4fc3f7' }}
-                />
-              </div>
-            </div>
-          </div>
+        {/* Sliders */}
+        <div className="gs-drawer-section">
+          <div className="gs-section-title">Controls</div>
+          {renderSlider('volValue', 'Volume', activePreset.volValue)}
+          {renderSlider('vibValue', 'Vibrato', activePreset.vibValue)}
+          {renderSlider('dampingValue', 'Damping', activePreset.dampingValue)}
         </div>
 
-        {/* Mode Button Grid */}
-        <div className="gs-mode-group">
-          {/* ── Instrument Toggle ── */}
-          <div className="gs-mode-row">
-            <button
-              className={`gs-mode-btn ${!isVeenaMode ? 'gs-mode-active' : ''}`}
-              onClick={() => setIsVeenaMode(false)}
-              style={{ fontSize: '0.9em', fontWeight: 600 }}
-            >🎸 Guitar</button>
-            <button
-              className={`gs-mode-btn ${isVeenaMode ? 'gs-mode-active' : ''}`}
-              onClick={() => setIsVeenaMode(true)}
-              style={{ fontSize: '0.9em', fontWeight: 600 }}
-            >🪕 Veena</button>
-          </div>
-          <div className="gs-mode-row">
-            {['2nd\nHmonic', 'Piano'].map(m => (
-              <button key={m} className="gs-mode-btn" style={{ whiteSpace: 'pre-line' }}>{m}</button>
-            ))}
-            <button className="gs-mode-btn gs-mode-active">Play\nTrack</button>
-          </div>
+        {/* Mode Buttons */}
+        <div className="gs-drawer-section">
+          <div className="gs-section-title">Scale Mode</div>
           <div className="gs-mode-row">
             <button
               className={`gs-mode-btn ${!isDiatonic ? 'gs-mode-active' : ''}`}
               onClick={() => setIsDiatonic(false)}
-            >Guitar</button>
-            <button className="gs-mode-btn">Pinch\nHmonic\nOn\nRelease</button>
+            >Chromatic</button>
             <button
               className={`gs-mode-btn ${isDiatonic ? 'gs-mode-active' : ''}`}
               onClick={() => setIsDiatonic(true)}
             >Diatonic</button>
-          </div>
-          <div className="gs-mode-row">
             <button
               className={`gs-mode-btn ${showSvara ? 'gs-mode-active' : ''}`}
               onClick={() => setShowSvara(v => !v)}
-            >Slide</button>
+            >Svara</button>
             <button
-              id="drone-toggle-btn"
               className={`gs-mode-btn ${droneOn ? 'gs-mode-active' : ''}`}
               onClick={toggleDrone}
-              title="Toggle Tanpura drone"
             >♪ Drone</button>
           </div>
         </div>
 
-        {/* Right Controls */}
-        <div className="gs-right-group">
-          <div className="gs-presets-label">All Presets Play</div>
-          <div className="gs-track-row">
-            <div className="gs-knob-group">
-              <div className="gs-knob" />
-              <div className="gs-knob-label">Track Vol</div>
-            </div>
-            <div className="gs-track-counter">
-              <span className="gs-track-num">1/174</span>
-            </div>
-          </div>
-
-          {/* Preset Selector */}
-          <div className="gs-preset-selector" onClick={() => setShowPresetMenu(v => !v)}>
-            <span className="gs-preset-name">{activePreset.name}</span>
-            <span className="gs-preset-arrow">▾</span>
-          </div>
-
+        {/* Play Mode */}
+        <div className="gs-drawer-section">
+          <div className="gs-section-title">Play Mode</div>
           <div className="gs-playmode-row">
-            <span className="gs-playmode-label">Play Mode:</span>
             {(['String', 'Poly', 'Mono'] as const).map(m => (
               <button
                 key={m}
@@ -586,24 +626,31 @@ export default function App() {
             ))}
           </div>
         </div>
-      </header>
 
-      {/* Preset Dropdown */}
-      {showPresetMenu && (
-        <div className="gs-preset-dropdown">
-          {presets.map((p, idx) => (
-            <div
-              key={p.id}
-              className={`gs-preset-item ${idx === activePresetIndex ? 'gs-preset-item-active' : ''}`}
-              onClick={() => selectPreset(idx)}
-            >
-              {p.name}
+        {/* Preset Selector */}
+        <div className="gs-drawer-section">
+          <div className="gs-section-title">Preset</div>
+          <div className="gs-preset-selector" onClick={() => setShowPresetMenu(v => !v)}>
+            <span className="gs-preset-name">{activePreset.name}</span>
+            <span className="gs-preset-arrow">▾</span>
+          </div>
+          {showPresetMenu && (
+            <div className="gs-preset-dropdown">
+              {presets.map((p, idx) => (
+                <div
+                  key={p.id}
+                  className={`gs-preset-item ${idx === activePresetIndex ? 'gs-preset-item-active' : ''}`}
+                  onClick={() => selectPreset(idx)}
+                >
+                  {p.name}
+                </div>
+              ))}
             </div>
-          ))}
+          )}
         </div>
-      )}
+      </div>
 
-      {/* ═══ KEYBOARD GRID ═══ */}
+      {/* ═══ FULLSCREEN KEYBOARD ═══ */}
       <main className="gs-keyboard">
         <KeyboardCanvas
           config={layoutConfig}
