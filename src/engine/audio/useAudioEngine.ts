@@ -6,7 +6,14 @@ import { useRef } from 'react'
 const WORKLET_URL = '/karplus-strong-processor.js'
 
 export interface AudioEngine {
-  noteOn: (voiceId: number, midiNote: number, keyX: number, keyY: number, keyZ: number) => Promise<void>
+  noteOn: (
+    voiceId: number,
+    midiNote: number,
+    keyX: number,
+    keyY: number,
+    keyZ: number,
+    options?: { decay?: number; brightness?: number }
+  ) => Promise<void>
   /** pitchBendCents: semitone deviation * 100, relative to the voice's base MIDI note */
   noteUpdate: (voiceId: number, pitchBendCents: number, keyY: number, keyZ: number) => void
   noteOff: (voiceId: number) => void
@@ -15,13 +22,13 @@ export interface AudioEngine {
   setMasterVolume: (volume: number) => void
   setPhysicalModelParams: (params: { stiffness?: number; brightness?: number; decay?: number }) => void
   setVibratoDepth: (depth: number) => void
+  setInstrumentParams: (params: { type: string; jawariAmount?: number; jawariThreshold?: number }) => void
+  setSympatheticParams: (scaleDegrees: number[], rootMidi: number, gain: number, decay: number) => void
 }
 
 /**
  * Minimal, dependency-free audio engine.
  * Signal path: KarplusStrong Worklet → MasterGain → Destination
- * All effects are handled inside the worklet or via simple Web Audio nodes.
- * No Tuna.js, no Tone.js — these were breaking the audio graph.
  */
 export function useAudioEngine(): AudioEngine {
   const ctxRef = useRef<AudioContext | null>(null)
@@ -31,6 +38,8 @@ export function useAudioEngine(): AudioEngine {
   // Keep params in sync even before context exists
   const pendingVolume = useRef(0.8)
   const physParams = useRef({ brightness: 0.5, decay: 0.992 })
+  const instParams = useRef({ type: 'guitar', jawariAmount: 0.0, jawariThreshold: 0.2 })
+  const pendingSympathetic = useRef<{ scaleDegrees: number[]; rootMidi: number; gain: number; decay: number } | null>(null)
 
   async function ensureCtx(): Promise<AudioContext> {
     if (ctxRef.current) {
@@ -74,11 +83,33 @@ export function useAudioEngine(): AudioEngine {
     workletRef.current = worklet
     masterGainRef.current = masterGain
 
+    // Sync pending state to the worklet on creation
+    if (pendingSympathetic.current) {
+      worklet.port.postMessage({
+        type: 'setSympatheticParams',
+        ...pendingSympathetic.current,
+      })
+    }
+
+    worklet.port.postMessage({
+      type: 'setInstrumentParams',
+      instrumentType: instParams.current.type,
+      jawariAmount: instParams.current.jawariAmount,
+      jawariThreshold: instParams.current.jawariThreshold,
+    })
+
     console.log('[AudioEngine] Audio graph connected. State:', ctx.state)
     return ctx
   }
 
-  const noteOn = async (voiceId: number, midiNote: number, _keyX: number, keyY: number, _keyZ: number) => {
+  const noteOn = async (
+    voiceId: number,
+    midiNote: number,
+    _keyX: number,
+    keyY: number,
+    _keyZ: number,
+    options?: { decay?: number; brightness?: number }
+  ) => {
     await ensureCtx()
     const worklet = workletRef.current
     if (!worklet) { console.error('[AudioEngine] No worklet after ensureCtx!'); return }
@@ -86,15 +117,16 @@ export function useAudioEngine(): AudioEngine {
     const frequency = 440 * Math.pow(2, (midiNote - 69) / 12)
     const velocity = 0.6 + keyY * 0.4
 
-    console.log(`[AudioEngine] noteOn voice=${voiceId} note=${midiNote} freq=${frequency.toFixed(1)} vel=${velocity.toFixed(2)}`)
-
     worklet.port.postMessage({
       type: 'noteOn',
       voiceId,
       frequency,
       velocity,
-      brightness: physParams.current.brightness,
-      decay: physParams.current.decay,
+      brightness: options?.brightness !== undefined ? options.brightness : physParams.current.brightness,
+      decay: options?.decay !== undefined ? options.decay : physParams.current.decay,
+      instrumentType: instParams.current.type,
+      jawariAmount: instParams.current.jawariAmount,
+      jawariThreshold: instParams.current.jawariThreshold,
     })
   }
 
@@ -106,13 +138,15 @@ export function useAudioEngine(): AudioEngine {
       voiceId,
       pitchBendCents,
       keyY,
+      instrumentType: instParams.current.type,
+      jawariAmount: instParams.current.jawariAmount,
+      jawariThreshold: instParams.current.jawariThreshold,
     })
   }
 
   const noteOff = (voiceId: number) => {
     const worklet = workletRef.current
     if (!worklet) return
-    console.log(`[AudioEngine] noteOff voice=${voiceId}`)
     worklet.port.postMessage({ type: 'noteOff', voiceId })
   }
 
@@ -145,6 +179,37 @@ export function useAudioEngine(): AudioEngine {
     }
   }
 
+  const setInstrumentParams = (params: { type: string; jawariAmount?: number; jawariThreshold?: number }) => {
+    instParams.current.type = params.type
+    if (params.jawariAmount !== undefined) instParams.current.jawariAmount = params.jawariAmount
+    if (params.jawariThreshold !== undefined) instParams.current.jawariThreshold = params.jawariThreshold
+
+    const worklet = workletRef.current
+    if (worklet) {
+      worklet.port.postMessage({
+        type: 'setInstrumentParams',
+        instrumentType: instParams.current.type,
+        jawariAmount: instParams.current.jawariAmount,
+        jawariThreshold: instParams.current.jawariThreshold,
+      })
+    }
+  }
+
+  const setSympatheticParams = (scaleDegrees: number[], rootMidi: number, gain: number, decay: number) => {
+    pendingSympathetic.current = { scaleDegrees, rootMidi, gain, decay }
+
+    const worklet = workletRef.current
+    if (worklet) {
+      worklet.port.postMessage({
+        type: 'setSympatheticParams',
+        scaleDegrees,
+        rootMidi,
+        sympatheticGain: gain,
+        sympatheticDecay: decay,
+      })
+    }
+  }
+
   const setVibratoDepth = (_depth: number) => {
     // Stub — add chorus/vibrato after base sound works
   }
@@ -157,6 +222,8 @@ export function useAudioEngine(): AudioEngine {
     setEffectParam,
     setMasterVolume,
     setPhysicalModelParams,
+    setInstrumentParams,
+    setSympatheticParams,
     setVibratoDepth,
   }
 }

@@ -13,6 +13,9 @@ export interface Preset {
       decay: number
       pluckPosition: number
       feedback: number
+      jawariAmount?: number
+      jawariThreshold?: number
+      sympatheticGain?: number
     }
   }
   performanceSettings: {
