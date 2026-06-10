@@ -1,6 +1,7 @@
-import React, { useRef, useEffect, useCallback } from 'react'
+import { useRef, useEffect, useCallback } from 'react'
 import { type KeyCell, type LayoutConfig, buildLayout } from '../engine/keyboard/KeyboardLayout'
-import { type VoiceManager, type TouchState } from '../engine/audio/VoiceManager'
+import { type VoiceManager } from '../engine/audio/VoiceManager'
+import { useKeyboardGesture } from '../hooks/useKeyboardGesture'
 
 interface TouchPoint {
   pointerId: number
@@ -209,88 +210,17 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
     return () => window.removeEventListener('resize', updateLayout)
   }, [updateLayout])
 
-  const hitTest = (x: number, y: number): KeyCell | null => {
-    return layout.current.find(cell =>
-      x >= cell.x && x < cell.x + cell.width &&
-      y >= cell.y && y < cell.y + cell.height
-    ) ?? null
-  }
-
   const requestRedraw = useCallback(() => {
     requestAnimationFrame(draw)
   }, [draw])
 
-  const handlePointerDown = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
-    e.preventDefault()
-    e.currentTarget.setPointerCapture(e.pointerId)
-    const rect = e.currentTarget.getBoundingClientRect()
-    const x = e.clientX - rect.left
-    const y = e.clientY - rect.top
-    const cell = hitTest(x, y)
-    if (!cell) return
-
-    const keyX = (x - cell.x) / cell.width
-    const keyY = 1 - (y - cell.y) / cell.height
-    const keyZ = e.pressure > 0 && e.pressure < 1 ? e.pressure : 0.5
-
-    activeTouches.current.set(e.pointerId, {
-      pointerId: e.pointerId,
-      clientX: e.clientX,
-      clientY: e.clientY,
-      pressure: keyZ,
-      initialX: x,
-      initialCell: cell,
-      cell,
-    })
-
-    const touchState: TouchState = {
-      pointerId: e.pointerId,
-      row: cell.row,
-      col: cell.col,
-      midiNote: cell.midiNote,
-      keyX,
-      keyY,
-      keyZ,
-    }
-
-    voiceManager.handleTouchDown(touchState)
-    requestRedraw()
-  }, [voiceManager, requestRedraw])
-
-  const handlePointerMove = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
-    const touch = activeTouches.current.get(e.pointerId)
-    if (!touch) return
-
-    const rect = e.currentTarget.getBoundingClientRect()
-    const x = e.clientX - rect.left
-    const y = e.clientY - rect.top
-
-    const cell = hitTest(x, y)
-    if (cell && (cell.row !== touch.cell.row || cell.col !== touch.cell.col)) {
-      touch.cell = cell
-    }
-
-    const dx = x - touch.initialX
-    const centsOffset = (dx / touch.initialCell.width) * 100
-
-    const keyY = 1 - (y - touch.cell.y) / touch.cell.height
-    const keyZ = e.pressure > 0 && e.pressure < 1 ? e.pressure : 0.5
-
-    touch.clientX = e.clientX
-    touch.clientY = e.clientY
-    touch.pressure = keyZ
-
-    voiceManager.handleTouchMove(e.pointerId, centsOffset, keyY, keyZ)
-    requestRedraw()
-  }, [voiceManager, requestRedraw])
-
-  const handlePointerUp = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
-    const touch = activeTouches.current.get(e.pointerId)
-    if (!touch) return
-    activeTouches.current.delete(e.pointerId)
-    voiceManager.handleTouchUp(e.pointerId, touch.initialCell.row)
-    requestRedraw()
-  }, [voiceManager, requestRedraw])
+  useKeyboardGesture({
+    layoutRef: layout,
+    voiceManager,
+    canvasRef,
+    activeTouchesRef: activeTouches,
+    requestRedraw,
+  })
 
   return (
     <canvas
@@ -303,10 +233,6 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
         userSelect: 'none',
         WebkitUserSelect: 'none',
       }}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-      onPointerCancel={handlePointerUp}
       onContextMenu={(e) => e.preventDefault()}
     />
   )
