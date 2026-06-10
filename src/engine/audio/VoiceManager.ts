@@ -114,9 +114,9 @@ export class VoiceManager {
     keyZ: number
     dx: number
     velocity: number
-  }): void {
+  }): number {
     const voiceId = this.pointerToVoice.get(params.pointerId)
-    if (voiceId === undefined) return
+    if (voiceId === undefined) return 0
 
     const pitchBendCents = this.slideEngine.update({
       voiceId,
@@ -130,6 +130,7 @@ export class VoiceManager {
     })
 
     this.audioEngine.noteUpdate(voiceId, pitchBendCents, params.keyY, params.keyZ)
+    return pitchBendCents
   }
 
   handleTouchUp(pointerId: number, row: number): void {

@@ -10,6 +10,7 @@ interface TouchPoint {
   initialX: number
   initialCell: KeyCell
   cell: KeyCell
+  pitchCents: number
 }
 
 interface UseKeyboardGestureOptions {
@@ -18,6 +19,23 @@ interface UseKeyboardGestureOptions {
   canvasRef: React.RefObject<HTMLCanvasElement | null>
   activeTouchesRef: React.RefObject<Map<number, TouchPoint>>
   requestRedraw: () => void
+  /** Called on initial press — gives renderer x/y for ripple placement */
+  onTouchDown?: (
+    pointerId: number,
+    cell: KeyCell,
+    clientX: number,
+    clientY: number,
+    keyZ: number
+  ) => void
+  /** Called on slide move — gives renderer x/y and live pitch for trail */
+  onTouchMove?: (
+    pointerId: number,
+    clientX: number,
+    clientY: number,
+    pitchBendCents: number
+  ) => void
+  /** Called on finger lift — lets renderer clear the trail */
+  onTouchUp?: (pointerId: number) => void
 }
 
 export function useKeyboardGesture({
@@ -26,18 +44,23 @@ export function useKeyboardGesture({
   canvasRef,
   activeTouchesRef,
   requestRedraw,
+  onTouchDown,
+  onTouchMove,
+  onTouchUp,
 }: UseKeyboardGestureOptions) {
   const hitTest = (x: number, y: number): KeyCell | null =>
-    (layoutRef.current || []).find(cell =>
-      x >= cell.x && x < cell.x + cell.width &&
-      y >= cell.y && y < cell.y + cell.height
+    (layoutRef.current || []).find(
+      (cell) =>
+        x >= cell.x &&
+        x < cell.x + cell.width &&
+        y >= cell.y &&
+        y < cell.y + cell.height
     ) ?? null
 
   useDrag(
     ({
       event,
       xy: [clientX, clientY],
-      delta: [, ],         // unused — we compute dx from stored initialX
       velocity: [vx, vy],
       first,
       last,
@@ -68,20 +91,36 @@ export function useKeyboardGesture({
           initialX: x,
           initialCell: cell,
           cell,
+          pitchCents: 0,
         })
 
-        voiceManager.handleTouchDown({ pointerId, row: cell.row, col: cell.col, midiNote: cell.midiNote, keyX, keyY, keyZ })
+        voiceManager.handleTouchDown({
+          pointerId,
+          row: cell.row,
+          col: cell.col,
+          midiNote: cell.midiNote,
+          keyX,
+          keyY,
+          keyZ,
+        })
+
+        // Notify renderer for ripple placement
+        onTouchDown?.(pointerId, cell, clientX, clientY, keyZ)
         requestRedraw()
 
       } else if (last) {
         const touch = activeTouchesRef.current.get(pointerId)
         if (!touch) return
         activeTouchesRef.current.delete(pointerId)
+
         voiceManager.handleTouchUp(pointerId, touch.initialCell.row)
+
+        // Notify renderer to clear trail
+        onTouchUp?.(pointerId)
         requestRedraw()
 
       } else {
-        // Slide in progress — feed all gesture data to the SlideEngine via VoiceManager
+        // Slide in progress
         const touch = activeTouchesRef.current.get(pointerId)
         if (!touch) return
 
@@ -98,13 +137,14 @@ export function useKeyboardGesture({
           : 0.5
         const keyZ = resolveKeyZ(event)
         const dx = x - touch.initialX
-        const speed = Math.sqrt(vx * vx + vy * vy)   // magnitude in px/ms
+        const speed = Math.sqrt(vx * vx + vy * vy)
 
         touch.clientX = clientX
         touch.clientY = clientY
         touch.pressure = keyZ
 
-        voiceManager.handleTouchMoveDetailed({
+        // handleTouchMoveDetailed now returns pitchBendCents
+        const pitchBendCents = voiceManager.handleTouchMoveDetailed({
           pointerId,
           newColumn: touch.cell?.col ?? touch.initialCell.col,
           newRow: touch.cell?.row ?? touch.initialCell.row,
@@ -114,6 +154,12 @@ export function useKeyboardGesture({
           dx,
           velocity: speed,
         })
+
+        // Store pitch bend in active touch for HUD bar rendering
+        touch.pitchCents = pitchBendCents
+
+        // Notify renderer for pitch trail point
+        onTouchMove?.(pointerId, clientX, clientY, pitchBendCents)
         requestRedraw()
       }
     },
@@ -130,4 +176,3 @@ function resolveKeyZ(event: Event): number {
   const pressure = (event as PointerEvent).pressure
   return pressure > 0 && pressure < 1 ? pressure : 0.5
 }
-
