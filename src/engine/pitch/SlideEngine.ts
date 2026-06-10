@@ -60,6 +60,10 @@ export class SlideEngine {
     this.config = config
   }
 
+  getConfig(): SlideEngineConfig {
+    return this.config
+  }
+
   updateConfig(patch: Partial<SlideEngineConfig>): void {
     this.config = { ...this.config, ...patch }
   }

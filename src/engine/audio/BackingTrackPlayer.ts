@@ -40,7 +40,7 @@ export class BackingTrackPlayer {
   stop() {
     try {
       this.sourceNode?.stop()
-    } catch (e) {
+    } catch (_e) {
       // ignore if already stopped
     }
     this.sourceNode = null

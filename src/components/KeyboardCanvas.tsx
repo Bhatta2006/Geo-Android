@@ -26,6 +26,7 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
   const activeTouches = useRef<Map<number, TouchPoint>>(new Map())
   const layout = useRef<KeyCell[]>([])
   const rendererRef = useRef<KeyboardRenderer>(new KeyboardRenderer())
+  const renderFrameRef = useRef<() => void>(() => {})
   const rafRef = useRef<number | null>(null)
 
   // ─── Animation Loop ──────────────────────────────────────────────────────────
@@ -48,13 +49,17 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
     }))
 
     rendererRef.current.drawFrame(canvas, ctx, layout.current, activeVoices, showSvara ?? false)
-    rafRef.current = requestAnimationFrame(renderFrame)
+    rafRef.current = requestAnimationFrame(renderFrameRef.current)
   }, [showSvara])
+
+  useEffect(() => {
+    renderFrameRef.current = renderFrame
+  }, [renderFrame])
 
   const startLoop = useCallback(() => {
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
-    rafRef.current = requestAnimationFrame(renderFrame)
-  }, [renderFrame])
+    rafRef.current = requestAnimationFrame(renderFrameRef.current)
+  }, [])
 
   const stopLoop = useCallback(() => {
     if (rafRef.current !== null) {
@@ -93,7 +98,7 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
   }, [])
 
   const onTouchDown = useCallback(
-    (_pointerId: number, cell: KeyCell, clientX: number, clientY: number, _keyZ: number) => {
+    (_pointerId: number, cell: KeyCell, clientX: number, clientY: number) => {
       const canvas = canvasRef.current
       if (!canvas) return
 
@@ -122,7 +127,9 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
       const y = clientY - rect.top
 
       // Feed the current pointer position into the pitch trail for this voice
-      rendererRef.current.addTrailPoint(pointerId, x, y, pitchBendCents)
+      const touch = activeTouches.current.get(pointerId)
+      const isRoot = touch?.initialCell.isRoot ?? false
+      rendererRef.current.addTrailPoint(pointerId, x, y, pitchBendCents, isRoot)
     },
     []
   )

@@ -1,7 +1,8 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { KeyboardCanvas } from './components/KeyboardCanvas'
 import { useAudioEngine } from './engine/audio/useAudioEngine'
 import { VoiceManager } from './engine/audio/VoiceManager'
+import { DroneEngine } from './engine/audio/DroneEngine'
 import { db, type Preset as DbPreset } from './presets/PresetSchema'
 import type { LayoutConfig } from './engine/keyboard/KeyboardLayout'
 
@@ -20,6 +21,15 @@ interface Preset {
   volValue: number
   vibValue: number
   dampingValue: number
+  // Physical model instrument type + jawari / sympathetic params
+  instrumentType: 'guitar' | 'veena_sitar'
+  jawariAmount: number
+  jawariThreshold: number
+  sympatheticGain: number
+  sympatheticDecay: number
+  // KS loop params used by audio engine
+  decayOverride?: number
+  brightnessOverride?: number
 }
 
 const SCALES: Record<string, { name: string; degrees: number[] }> = {
@@ -47,8 +57,14 @@ const FACTORY_PRESETS: Preset[] = [
     volValue: 0.8,
     vibValue: 0.2,
     dampingValue: 0.3,
+    instrumentType: 'guitar',
+    jawariAmount: 0.0,
+    jawariThreshold: 0.2,
+    sympatheticGain: 0.0,
+    sympatheticDecay: 0.998,
   },
   {
+    // Sitar preset — Mayamalavagowla raga, aggressive sitar buzz
     id: 'sitar-raga',
     name: 'Sitar Raga',
     rows: 4,
@@ -58,11 +74,18 @@ const FACTORY_PRESETS: Preset[] = [
     rootNote: 0,
     snapEnabled: true,
     roundEnabled: true,
-    slideSpeed: 0.25,
+    slideSpeed: 0.05,
     diatonicEnabled: true,
     volValue: 0.75,
     vibValue: 0.1,
-    dampingValue: 0.5,
+    dampingValue: 0.3,
+    instrumentType: 'veena_sitar',
+    jawariAmount: 0.65,      // sitar-level buzz (plan: 0.6–0.8)
+    jawariThreshold: 0.15,
+    sympatheticGain: 0.2,
+    sympatheticDecay: 0.9985,
+    decayOverride: 0.9955,
+    brightnessOverride: 0.80,
   },
   {
     id: 'acoustic-steel',
@@ -79,7 +102,36 @@ const FACTORY_PRESETS: Preset[] = [
     volValue: 0.85,
     vibValue: 0.0,
     dampingValue: 0.2,
-  }
+    instrumentType: 'guitar',
+    jawariAmount: 0.0,
+    jawariThreshold: 0.2,
+    sympatheticGain: 0.0,
+    sympatheticDecay: 0.998,
+  },
+  {
+    // Xitar 1.5 — Mahesh Raghavan style (exact parameters from Phase2.md §5.4)
+    id: 'xitar-mahesh',
+    name: 'Xitar 1.5',
+    rows: 4,
+    startMidiNote: 48,             // C3
+    scaleName: 'kharaharapriya',   // Kharaharapriya = plan §5.4 scale
+    scale: SCALES.kharaharapriya.degrees,
+    rootNote: 0,                   // C
+    snapEnabled: true,
+    roundEnabled: true,
+    slideSpeed: 0.05,              // §5.4 slideSpeed
+    diatonicEnabled: true,
+    volValue: 0.78,
+    vibValue: 0.05,
+    dampingValue: 0.2,
+    instrumentType: 'veena_sitar',
+    jawariAmount: 0.45,            // §5.4 jawariAmount
+    jawariThreshold: 0.18,         // §5.4 jawariThreshold
+    sympatheticGain: 0.25,         // §5.4 sympatheticGain
+    sympatheticDecay: 0.9985,      // §5.4 sympatheticDecay
+    decayOverride: 0.9960,         // §5.4 decay
+    brightnessOverride: 0.88,      // §5.4 brightness
+  },
 ]
 
 export default function App() {
@@ -93,17 +145,18 @@ export default function App() {
   const [isDiatonic, setIsDiatonic] = useState<boolean>(FACTORY_PRESETS[0].diatonicEnabled)
   const [showPresetMenu, setShowPresetMenu] = useState<boolean>(false)
   const [playMode, setPlayMode] = useState<'String' | 'Poly' | 'Mono'>('String')
+  const [droneOn, setDroneOn] = useState<boolean>(false)
 
-  const audioEngineRef = useRef(audioEngine)
-  audioEngineRef.current = audioEngine
-
-  // VoiceManager init using lazy ref — safe, no conditional hooks
-  const voiceManagerRef = useRef<VoiceManager | null>(null)
-  if (voiceManagerRef.current === null) {
-    voiceManagerRef.current = new VoiceManager(audioEngineRef.current, 'string')
-  }
+  const voiceManager = useMemo(() => new VoiceManager(audioEngine, 'string'), [audioEngine])
+  const droneEngine = useMemo(() => new DroneEngine(audioEngine), [audioEngine])
 
   const activePreset = presets[activePresetIndex]
+
+  const [prevPresetId, setPrevPresetId] = useState<string>(activePreset?.id)
+  if (activePreset && activePreset.id !== prevPresetId) {
+    setPrevPresetId(activePreset.id)
+    setIsDiatonic(activePreset.diatonicEnabled)
+  }
 
   // Dexie DB Sync on mount
   useEffect(() => {
@@ -159,7 +212,13 @@ export default function App() {
           diatonicEnabled: p.performanceSettings.diatonicEnabled,
           volValue: p.controlSurface.volValue,
           vibValue: p.controlSurface.vibValue,
-          dampingValue: p.controlSurface.dampingValue
+          dampingValue: p.controlSurface.dampingValue,
+          // Physical model fields — fall back to guitar defaults for legacy DB entries
+          instrumentType: (p.instrument?.type === 'veena_sitar' ? 'veena_sitar' : 'guitar') as 'guitar' | 'veena_sitar',
+          jawariAmount: p.instrument?.parameters?.jawariAmount ?? 0.0,
+          jawariThreshold: p.instrument?.parameters?.jawariThreshold ?? 0.2,
+          sympatheticGain: p.instrument?.parameters?.sympatheticGain ?? 0.0,
+          sympatheticDecay: 0.9985,
         }))
         setPresets(mapped)
       } catch (e) {
@@ -169,23 +228,25 @@ export default function App() {
     syncDb()
   }, [])
 
-  useEffect(() => {
-    setIsDiatonic(activePreset.diatonicEnabled)
-  }, [activePreset])
+
 
   useEffect(() => {
-    if (voiceManagerRef.current) {
-      const mode = playMode === 'String' ? 'string' : playMode === 'Poly' ? 'poly' : 'mono'
-      voiceManagerRef.current.setPlayMode(mode)
-      voiceManagerRef.current.setConfig({
-        snapEnabled: activePreset.snapEnabled,
-        roundEnabled: activePreset.roundEnabled,
-        slideSpeed: activePreset.slideSpeed,
-        scale: isDiatonic ? activePreset.scale : SCALES.chromatic.degrees,
-        temperamentOffsets: new Array(12).fill(0)
-      })
-    }
-  }, [activePreset, isDiatonic, playMode])
+    const mode = playMode === 'String' ? 'string' : playMode === 'Poly' ? 'poly' : 'mono'
+    voiceManager.setPlayMode(mode)
+    // Pass actual layout startMidiNote+octave and rowIntervals so SlideEngine
+    // pitch math stays in sync with the key cells that are rendered.
+    const effectiveStartMidi = activePreset.startMidiNote + (octave - 2) * 12
+    const effectiveRowIntervals = activePreset.rows === 6 ? [5, 5, 5, 4, 5] : [5]
+    voiceManager.setConfig({
+      snapEnabled: activePreset.snapEnabled,
+      roundEnabled: activePreset.roundEnabled,
+      slideSpeed: activePreset.slideSpeed,
+      scale: isDiatonic ? activePreset.scale : SCALES.chromatic.degrees,
+      temperamentOffsets: new Array(12).fill(0),
+      startMidiNote: effectiveStartMidi,
+      rowIntervals: effectiveRowIntervals,
+    })
+  }, [voiceManager, activePreset, isDiatonic, playMode, octave])
 
   // Apply audio params whenever preset values change
   useEffect(() => {
@@ -193,14 +254,34 @@ export default function App() {
   }, [audioEngine, activePreset.volValue])
 
   useEffect(() => {
-    const decay = 0.998 - activePreset.dampingValue * 0.015
-    const brightness = 0.3 + (1 - activePreset.dampingValue) * 0.5
+    // Use preset-specific decay/brightness overrides if present (veena/xitar presets)
+    const decay = activePreset.decayOverride ?? (0.998 - activePreset.dampingValue * 0.015)
+    const brightness = activePreset.brightnessOverride ?? (0.3 + (1 - activePreset.dampingValue) * 0.5)
     audioEngine.setPhysicalModelParams({ decay, brightness })
-  }, [audioEngine, activePreset.dampingValue])
+  }, [audioEngine, activePreset.dampingValue, activePreset.decayOverride, activePreset.brightnessOverride])
 
   useEffect(() => {
     audioEngine.setVibratoDepth(activePreset.vibValue)
   }, [audioEngine, activePreset.vibValue])
+
+  // Wire instrument type (jawari) + sympathetic parameters to worklet on preset change
+  useEffect(() => {
+    audioEngine.setInstrumentParams({
+      type: activePreset.instrumentType,
+      jawariAmount: activePreset.jawariAmount,
+      jawariThreshold: activePreset.jawariThreshold,
+    })
+    // Always update sympathetic bank — pass empty scale for guitar to disable
+    const scale = activePreset.instrumentType === 'veena_sitar'
+      ? (isDiatonic ? activePreset.scale : SCALES.kharaharapriya.degrees)
+      : []
+    audioEngine.setSympatheticParams(
+      scale,
+      activePreset.startMidiNote + activePreset.rootNote,
+      activePreset.sympatheticGain,
+      activePreset.sympatheticDecay,
+    )
+  }, [audioEngine, activePreset, isDiatonic])
 
   // Effect presets per instrument
   useEffect(() => {
@@ -279,6 +360,32 @@ export default function App() {
     setActivePresetIndex(index)
     setShowPresetMenu(false)
   }
+
+  // Drone toggle handler
+  const toggleDrone = useCallback(() => {
+    if (droneEngine.active) {
+      droneEngine.stop()
+      setDroneOn(false)
+    } else {
+      // Root MIDI = startMidiNote + rootNote + octave offset
+      const rootMidi = activePreset.startMidiNote + activePreset.rootNote + (octave - 2) * 12
+      droneEngine.start(rootMidi)
+      setDroneOn(true)
+    }
+  }, [droneEngine, activePreset, octave])
+
+  // Retune drone when octave or preset changes while drone is active
+  useEffect(() => {
+    if (droneEngine.active) {
+      const rootMidi = activePreset.startMidiNote + activePreset.rootNote + (octave - 2) * 12
+      droneEngine.setRootMidi(rootMidi)
+    }
+  }, [droneEngine, octave, activePreset])
+
+  // Stop drone when component unmounts
+  useEffect(() => {
+    return () => { droneEngine.stop() }
+  }, [droneEngine])
 
   // Layout config
   const layoutConfig: LayoutConfig = {
@@ -403,6 +510,12 @@ export default function App() {
               className={`gs-mode-btn ${showSvara ? 'gs-mode-active' : ''}`}
               onClick={() => setShowSvara(v => !v)}
             >Slide</button>
+            <button
+              id="drone-toggle-btn"
+              className={`gs-mode-btn ${droneOn ? 'gs-mode-active' : ''}`}
+              onClick={toggleDrone}
+              title="Toggle Tanpura drone"
+            >♪ Drone</button>
           </div>
         </div>
 
@@ -457,7 +570,7 @@ export default function App() {
       <main className="gs-keyboard">
         <KeyboardCanvas
           config={layoutConfig}
-          voiceManager={voiceManagerRef.current}
+          voiceManager={voiceManager}
           showSvara={showSvara}
         />
       </main>
