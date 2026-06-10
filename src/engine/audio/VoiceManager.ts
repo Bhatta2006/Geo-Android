@@ -18,6 +18,10 @@ export interface VoiceManagerConfig {
   slideSpeed: number
   scale: number[]
   temperamentOffsets: number[]
+  /** Starting MIDI note of the bottom-left key — must match the active LayoutConfig */
+  startMidiNote?: number
+  /** Row interval semitones — must match the active LayoutConfig */
+  rowIntervals?: number[]
 }
 
 export class VoiceManager {
@@ -188,15 +192,16 @@ export class VoiceManager {
   }
 
   private buildSlideConfig(patch?: Partial<VoiceManagerConfig>): SlideEngineConfig {
+    const current = this.slideEngine ? (this.slideEngine as any).config as SlideEngineConfig : null
     return {
-      snapEnabled: patch?.snapEnabled ?? true,
-      roundEnabled: patch?.roundEnabled ?? true,
-      slideSpeed: patch?.slideSpeed ?? 0.15,
-      diatonicMode: false,
-      scale: patch?.scale ?? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-      temperamentOffsets: patch?.temperamentOffsets ?? new Array(12).fill(0),
-      rowIntervals: [5, 5, 5, 4, 5],  // guitar-style fourths
-      startMidiNote: 40,              // E2 — will be overridden by layout config
+      snapEnabled:         patch?.snapEnabled         ?? current?.snapEnabled         ?? true,
+      roundEnabled:        patch?.roundEnabled        ?? current?.roundEnabled        ?? true,
+      slideSpeed:          patch?.slideSpeed          ?? current?.slideSpeed          ?? 0.15,
+      diatonicMode:        false,
+      scale:               patch?.scale               ?? current?.scale               ?? [0,1,2,3,4,5,6,7,8,9,10,11],
+      temperamentOffsets:  patch?.temperamentOffsets  ?? current?.temperamentOffsets  ?? new Array(12).fill(0),
+      rowIntervals:        patch?.rowIntervals        ?? current?.rowIntervals        ?? [5, 5, 5, 4, 5],
+      startMidiNote:       patch?.startMidiNote       ?? current?.startMidiNote       ?? 40,
     }
   }
 }

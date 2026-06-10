@@ -242,15 +242,21 @@ export default function App() {
     if (voiceManagerRef.current) {
       const mode = playMode === 'String' ? 'string' : playMode === 'Poly' ? 'poly' : 'mono'
       voiceManagerRef.current.setPlayMode(mode)
+      // Pass actual layout startMidiNote+octave and rowIntervals so SlideEngine
+      // pitch math stays in sync with the key cells that are rendered.
+      const effectiveStartMidi = activePreset.startMidiNote + (octave - 2) * 12
+      const effectiveRowIntervals = activePreset.rows === 6 ? [5, 5, 5, 4, 5] : [5]
       voiceManagerRef.current.setConfig({
         snapEnabled: activePreset.snapEnabled,
         roundEnabled: activePreset.roundEnabled,
         slideSpeed: activePreset.slideSpeed,
         scale: isDiatonic ? activePreset.scale : SCALES.chromatic.degrees,
-        temperamentOffsets: new Array(12).fill(0)
+        temperamentOffsets: new Array(12).fill(0),
+        startMidiNote: effectiveStartMidi,
+        rowIntervals: effectiveRowIntervals,
       })
     }
-  }, [activePreset, isDiatonic, playMode])
+  }, [activePreset, isDiatonic, playMode, octave])
 
   // Apply audio params whenever preset values change
   useEffect(() => {

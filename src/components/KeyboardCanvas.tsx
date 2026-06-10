@@ -122,7 +122,9 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
       const y = clientY - rect.top
 
       // Feed the current pointer position into the pitch trail for this voice
-      rendererRef.current.addTrailPoint(pointerId, x, y, pitchBendCents)
+      const touch = activeTouches.current.get(pointerId)
+      const isRoot = touch?.initialCell.isRoot ?? false
+      rendererRef.current.addTrailPoint(pointerId, x, y, pitchBendCents, isRoot)
     },
     []
   )
