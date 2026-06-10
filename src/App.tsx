@@ -387,6 +387,18 @@ export default function App() {
     return () => { droneEngine.stop() }
   }, [droneEngine])
 
+  // Re-unlock AudioContext when page becomes visible again
+  // (iOS / Chrome suspend audio when the tab is backgrounded)
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        audioEngine.unlockAudio()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+  }, [audioEngine])
+
   // Layout config
   const layoutConfig: LayoutConfig = {
     rows: activePreset.rows,
@@ -572,6 +584,7 @@ export default function App() {
           config={layoutConfig}
           voiceManager={voiceManager}
           showSvara={showSvara}
+          audioEngine={audioEngine}
         />
       </main>
     </div>

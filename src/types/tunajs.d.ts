@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 declare module 'tunajs' {
   export default class Tuna {
     constructor(context: AudioContext);

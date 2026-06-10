@@ -48,11 +48,17 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
     const Nint = Math.round(N)
     if (Nint < 2 || Nint > MAXBUF) return
 
-    // Half-sine shaped noise excitation — models a pluck
+    // ── Bandlimited noise excitation (models a pluck without harsh high-freq) ──
+    // Two-point averager applied to shaped noise removes aliasing artifacts
+    // that cause the 'harsh' sound on attack.
     const buf = new Float32Array(MAXBUF)
+    let prev = 0
     for (let i = 0; i < Nint; i++) {
-      const env = Math.sin(Math.PI * i / Nint)
-      buf[i] = (Math.random() * 2 - 1) * velocity * env
+      const env       = Math.sin(Math.PI * i / Nint)
+      const rawNoise  = (Math.random() * 2 - 1)
+      const smoothed  = (rawNoise + prev) * 0.5   // one-pole low-pass
+      prev = rawNoise
+      buf[i] = smoothed * velocity * env * 0.85
     }
 
     this.voices.set(voiceId, {
@@ -65,14 +71,15 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
       lastOut: 0,
       releasing: false,
       releaseDecay: 0.997,
-      basePitchBendCents: 0,
+      // Pitch bend state — smoothed to avoid clicking/zipper noise on slides
+      targetPitchBendCents: 0,
+      smoothPitchBend: 0,
       instrumentType,
       jawariAmount,
       jawariThreshold,
     })
 
     // Excite the sympathetic bank whenever a note is struck
-    // (matches plan: inject excitation * gain * 0.05 into each string)
     if (this.sympatheticStrings.length > 0 && this.sympatheticGain > 0.001) {
       const excitation = velocity * 0.5
       for (let s = 0; s < this.sympatheticStrings.length; s++) {
@@ -98,7 +105,8 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
   _noteUpdate({ voiceId, pitchBendCents, keyY, instrumentType, jawariAmount, jawariThreshold }) {
     const v = this.voices.get(voiceId)
     if (!v) return
-    if (pitchBendCents  !== undefined) v.basePitchBendCents = pitchBendCents
+    // Store as TARGET — the process() loop smooths toward it each block
+    if (pitchBendCents  !== undefined) v.targetPitchBendCents = pitchBendCents
     if (keyY            !== undefined) v.brightness = 0.1 + Math.max(0, Math.min(1, keyY)) * 0.65
     if (instrumentType  !== undefined) v.instrumentType    = instrumentType
     if (jawariAmount    !== undefined) v.jawariAmount      = jawariAmount
@@ -200,8 +208,15 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
 
     // ── Process each KS voice ────────────────────────────────────────
     for (const [id, v] of this.voices) {
-      // Compute effective delay from pitch bend — 2^(cents/1200)
-      const bendRatio = Math.pow(2, (v.basePitchBendCents ?? 0) / 1200)
+      // ── Smooth pitch bend toward target (4% per block = ~10ms at 128 samp/44.1kHz)
+      // This prevents zipper noise / clicking during fast slides.
+      const targetBend = v.targetPitchBendCents ?? 0
+      v.smoothPitchBend = v.smoothPitchBend !== undefined
+        ? v.smoothPitchBend + (targetBend - v.smoothPitchBend) * 0.04
+        : targetBend
+
+      // Compute effective delay from SMOOTHED pitch bend — 2^(cents/1200)
+      const bendRatio = Math.pow(2, v.smoothPitchBend / 1200)
       const rawDelay  = v.delayLength / bendRatio
       const D         = Math.max(2, Math.min(v.MAXBUF - 2, rawDelay))
       const Dint      = Math.floor(D)
@@ -238,6 +253,7 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
 
         const amp = x * 0.5
         outL[i] += amp
+        if (outR) outR[i] += amp
       }
 
       // Release ramp
