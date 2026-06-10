@@ -192,7 +192,7 @@ export class VoiceManager {
   }
 
   private buildSlideConfig(patch?: Partial<VoiceManagerConfig>): SlideEngineConfig {
-    const current = this.slideEngine ? (this.slideEngine as any).config as SlideEngineConfig : null
+    const current = this.slideEngine ? this.slideEngine.getConfig() : null
     return {
       snapEnabled:         patch?.snapEnabled         ?? current?.snapEnabled         ?? true,
       roundEnabled:        patch?.roundEnabled        ?? current?.roundEnabled        ?? true,

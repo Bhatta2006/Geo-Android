@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { KeyboardCanvas } from './components/KeyboardCanvas'
 import { useAudioEngine } from './engine/audio/useAudioEngine'
 import { VoiceManager } from './engine/audio/VoiceManager'
@@ -147,22 +147,16 @@ export default function App() {
   const [playMode, setPlayMode] = useState<'String' | 'Poly' | 'Mono'>('String')
   const [droneOn, setDroneOn] = useState<boolean>(false)
 
-  const audioEngineRef = useRef(audioEngine)
-  audioEngineRef.current = audioEngine
-
-  // VoiceManager init using lazy ref — safe, no conditional hooks
-  const voiceManagerRef = useRef<VoiceManager | null>(null)
-  if (voiceManagerRef.current === null) {
-    voiceManagerRef.current = new VoiceManager(audioEngineRef.current, 'string')
-  }
-
-  // DroneEngine instance — lazy ref
-  const droneEngineRef = useRef<DroneEngine | null>(null)
-  if (droneEngineRef.current === null) {
-    droneEngineRef.current = new DroneEngine(audioEngineRef.current)
-  }
+  const voiceManager = useMemo(() => new VoiceManager(audioEngine, 'string'), [audioEngine])
+  const droneEngine = useMemo(() => new DroneEngine(audioEngine), [audioEngine])
 
   const activePreset = presets[activePresetIndex]
+
+  const [prevPresetId, setPrevPresetId] = useState<string>(activePreset?.id)
+  if (activePreset && activePreset.id !== prevPresetId) {
+    setPrevPresetId(activePreset.id)
+    setIsDiatonic(activePreset.diatonicEnabled)
+  }
 
   // Dexie DB Sync on mount
   useEffect(() => {
@@ -234,29 +228,25 @@ export default function App() {
     syncDb()
   }, [])
 
-  useEffect(() => {
-    setIsDiatonic(activePreset.diatonicEnabled)
-  }, [activePreset])
+
 
   useEffect(() => {
-    if (voiceManagerRef.current) {
-      const mode = playMode === 'String' ? 'string' : playMode === 'Poly' ? 'poly' : 'mono'
-      voiceManagerRef.current.setPlayMode(mode)
-      // Pass actual layout startMidiNote+octave and rowIntervals so SlideEngine
-      // pitch math stays in sync with the key cells that are rendered.
-      const effectiveStartMidi = activePreset.startMidiNote + (octave - 2) * 12
-      const effectiveRowIntervals = activePreset.rows === 6 ? [5, 5, 5, 4, 5] : [5]
-      voiceManagerRef.current.setConfig({
-        snapEnabled: activePreset.snapEnabled,
-        roundEnabled: activePreset.roundEnabled,
-        slideSpeed: activePreset.slideSpeed,
-        scale: isDiatonic ? activePreset.scale : SCALES.chromatic.degrees,
-        temperamentOffsets: new Array(12).fill(0),
-        startMidiNote: effectiveStartMidi,
-        rowIntervals: effectiveRowIntervals,
-      })
-    }
-  }, [activePreset, isDiatonic, playMode, octave])
+    const mode = playMode === 'String' ? 'string' : playMode === 'Poly' ? 'poly' : 'mono'
+    voiceManager.setPlayMode(mode)
+    // Pass actual layout startMidiNote+octave and rowIntervals so SlideEngine
+    // pitch math stays in sync with the key cells that are rendered.
+    const effectiveStartMidi = activePreset.startMidiNote + (octave - 2) * 12
+    const effectiveRowIntervals = activePreset.rows === 6 ? [5, 5, 5, 4, 5] : [5]
+    voiceManager.setConfig({
+      snapEnabled: activePreset.snapEnabled,
+      roundEnabled: activePreset.roundEnabled,
+      slideSpeed: activePreset.slideSpeed,
+      scale: isDiatonic ? activePreset.scale : SCALES.chromatic.degrees,
+      temperamentOffsets: new Array(12).fill(0),
+      startMidiNote: effectiveStartMidi,
+      rowIntervals: effectiveRowIntervals,
+    })
+  }, [voiceManager, activePreset, isDiatonic, playMode, octave])
 
   // Apply audio params whenever preset values change
   useEffect(() => {
@@ -373,32 +363,29 @@ export default function App() {
 
   // Drone toggle handler
   const toggleDrone = useCallback(() => {
-    const engine = droneEngineRef.current
-    if (!engine) return
-    if (engine.active) {
-      engine.stop()
+    if (droneEngine.active) {
+      droneEngine.stop()
       setDroneOn(false)
     } else {
       // Root MIDI = startMidiNote + rootNote + octave offset
       const rootMidi = activePreset.startMidiNote + activePreset.rootNote + (octave - 2) * 12
-      engine.start(rootMidi)
+      droneEngine.start(rootMidi)
       setDroneOn(true)
     }
-  }, [activePreset, octave])
+  }, [droneEngine, activePreset, octave])
 
   // Retune drone when octave or preset changes while drone is active
   useEffect(() => {
-    const engine = droneEngineRef.current
-    if (engine && engine.active) {
+    if (droneEngine.active) {
       const rootMidi = activePreset.startMidiNote + activePreset.rootNote + (octave - 2) * 12
-      engine.setRootMidi(rootMidi)
+      droneEngine.setRootMidi(rootMidi)
     }
-  }, [octave, activePreset])
+  }, [droneEngine, octave, activePreset])
 
   // Stop drone when component unmounts
   useEffect(() => {
-    return () => { droneEngineRef.current?.stop() }
-  }, [])
+    return () => { droneEngine.stop() }
+  }, [droneEngine])
 
   // Layout config
   const layoutConfig: LayoutConfig = {
@@ -583,7 +570,7 @@ export default function App() {
       <main className="gs-keyboard">
         <KeyboardCanvas
           config={layoutConfig}
-          voiceManager={voiceManagerRef.current}
+          voiceManager={voiceManager}
           showSvara={showSvara}
         />
       </main>
