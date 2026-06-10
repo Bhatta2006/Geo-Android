@@ -14,6 +14,7 @@ const MAXBUF = 4096  // large enough for lowest notes (~20 Hz @ 44.1 kHz = 2205 
 class KarplusStrongProcessor extends AudioWorkletProcessor {
   constructor() {
     super()
+    console.log('[KS-Processor] AudioWorklet processor created')
 
     // Active KS voices
     this.voices = new Map()
@@ -87,20 +88,32 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
     // coefficient b controls how quickly HF energy is lost each loop
     const loopCoeff = this._brightnessToCoeff(brightness, frequency)
 
+    console.log(`[KS-Processor] noteOn: voiceId=${voiceId}, freq=${frequency.toFixed(1)} Hz, N=${N.toFixed(1)}, Nint=${Nint}`)
+
     this.voices.set(voiceId, {
       buf,
       N,               // float delay length (original, without pitch bend)
-      ptr: 0,          // write pointer into circular buffer
+      // ┌─────────────────────────────────────────────────────────────┐
+      // │ CRITICAL: ptr must start AFTER the excitation region.      │
+      // │ Excitation fills buf[0 .. Nint-1].                         │
+      // │ The read pointer reads from (ptr - Nint), which is         │
+      // │ Nint positions behind the write pointer.                   │
+      // │ If ptr starts at 0, the read would go to (0 - Nint + BUF) │
+      // │ = MAXBUF - Nint, which is all zeros. The write at ptr=0    │
+      // │ would then overwrite the excitation with 0 before the      │
+      // │ read pointer ever reaches it. TOTAL SILENCE.               │
+      // │ Starting ptr at Nint means the first read goes to index 0  │
+      // │ = start of excitation. The KS loop works correctly.        │
+      // └─────────────────────────────────────────────────────────────┘
+      ptr: Nint,
       loopGain: decay,
       loopCoeff,       // LPF coefficient (b in the one-pole formula above)
       lastOut: 0,
 
       // Pitch bend state
-      // smoothPitchBend is in CENTS relative to original frequency
-      // We smooth it toward targetPitchBendCents per-sample inside process()
       targetPitchBendCents: 0,
       smoothPitchBend: 0,
-      pitchBendActive: false,  // set true once first noteUpdate arrives
+      pitchBendActive: false,
 
       // Release state
       releasing: false,
@@ -112,9 +125,11 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
       jawariThreshold,
 
       // Amplitude envelope — short soft-attack to prevent click at onset
-      // Rises from 0 to 1 over ~5ms (220 samples @ 44.1kHz)
       ampEnv: 0.0,
-      ampAttackRate: 1 / (sampleRate * 0.006),  // fully on in ~6ms
+      ampAttackRate: 1 / (sampleRate * 0.005),  // fully on in ~5ms
+
+      // Age counter (in samples) — prevents premature silence cleanup
+      sampleAge: 0,
     })
 
     // Excite sympathetic bank on note strike
@@ -321,6 +336,9 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
         if (outR) outR[i] += amp * 0.98
       }
 
+      // Track voice age for silence guard
+      v.sampleAge += len
+
       // Release ramp — applied per-block (not per-sample) for efficiency
       if (v.releasing) {
         v.loopGain *= Math.pow(v.releaseDecay, len)
@@ -330,8 +348,12 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
         }
       }
 
-      // Silence cleanup
-      if (Math.abs(v.lastOut) < 5e-8 && !v.releasing) {
+      // Silence cleanup — only after the voice has lived long enough
+      // for the excitation to loop through at least 4 full delay cycles.
+      // Without this guard, a voice could be killed on its very first
+      // process() block if lastOut is still 0.
+      const minAge = v.N * 4
+      if (v.sampleAge > minAge && Math.abs(v.lastOut) < 5e-8 && !v.releasing) {
         this.voices.delete(id)
       }
     }

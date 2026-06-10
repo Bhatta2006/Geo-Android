@@ -140,7 +140,8 @@ export class VoiceManager {
   handleTouchUp(pointerId: number, row: number): void {
     const voiceId = this.pointerToVoice.get(pointerId)
     this.pointerToVoice.delete(pointerId)
-    this.slideEngine.clearVoice(pointerId)
+    // Clear SlideEngine state by voiceId (not pointerId — SlideEngine is keyed by voiceId)
+    if (voiceId !== undefined) this.slideEngine.clearVoice(voiceId)
 
     if (this.playMode !== 'string') {
       if (voiceId !== undefined) this.audioEngine.noteOff(voiceId)
