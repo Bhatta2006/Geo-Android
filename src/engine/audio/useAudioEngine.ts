@@ -51,7 +51,7 @@ class AudioEngineImpl implements AudioEngine {
   // ── Pending state (applied as soon as worklet becomes ready) ────────────
   private pendingNotes: Array<() => void> = []
   private pendingVolume = 0.8
-  private physParams = { brightness: 0.5, decay: 0.992 }
+  private physParams = { brightness: 0.5, decay: 0.99996 }
   private instParams = { type: 'guitar', jawariAmount: 0.0, jawariThreshold: 0.2 }
   private pendingSympathetic: { scaleDegrees: number[]; rootMidi: number; gain: number; decay: number } | null = null
 

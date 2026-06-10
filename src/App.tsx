@@ -84,7 +84,7 @@ const FACTORY_PRESETS: Preset[] = [
     jawariThreshold: 0.15,
     sympatheticGain: 0.2,
     sympatheticDecay: 0.9985,
-    decayOverride: 0.9955,
+    decayOverride: 0.99997,
     brightnessOverride: 0.80,
   },
   {
@@ -129,7 +129,7 @@ const FACTORY_PRESETS: Preset[] = [
     jawariThreshold: 0.18,         // §5.4 jawariThreshold
     sympatheticGain: 0.25,         // §5.4 sympatheticGain
     sympatheticDecay: 0.9985,      // §5.4 sympatheticDecay
-    decayOverride: 0.9960,         // §5.4 decay
+    decayOverride: 0.99998,         // §5.4 decay — very long sustain for slides
     brightnessOverride: 0.88,      // §5.4 brightness
   },
 ]
@@ -146,6 +146,7 @@ export default function App() {
   const [showPresetMenu, setShowPresetMenu] = useState<boolean>(false)
   const [playMode, setPlayMode] = useState<'String' | 'Poly' | 'Mono'>('String')
   const [droneOn, setDroneOn] = useState<boolean>(false)
+  const [isVeenaMode, setIsVeenaMode] = useState<boolean>(false)
 
   const voiceManager = useMemo(() => new VoiceManager(audioEngine, 'string'), [audioEngine])
   const droneEngine = useMemo(() => new DroneEngine(audioEngine), [audioEngine])
@@ -254,11 +255,15 @@ export default function App() {
   }, [audioEngine, activePreset.volValue])
 
   useEffect(() => {
-    // Use preset-specific decay/brightness overrides if present (veena/xitar presets)
-    const decay = activePreset.decayOverride ?? (0.998 - activePreset.dampingValue * 0.015)
+    // Decay formula: per-sample loopGain. Must be very close to 1 for audible sustain.
+    // 0.99996 ≈ 3.5s sustain, 0.99998 ≈ 7s sustain.
+    // Old formula (0.998 - damp*0.015) gave loopGain≈0.993 which killed notes in ~50ms.
+    const baseDecay = activePreset.decayOverride ?? (0.99996 - activePreset.dampingValue * 0.0001)
+    // Veena mode forces longer sustain for expressive slides
+    const decay = isVeenaMode ? Math.max(baseDecay, 0.99998) : baseDecay
     const brightness = activePreset.brightnessOverride ?? (0.3 + (1 - activePreset.dampingValue) * 0.5)
     audioEngine.setPhysicalModelParams({ decay, brightness })
-  }, [audioEngine, activePreset.dampingValue, activePreset.decayOverride, activePreset.brightnessOverride])
+  }, [audioEngine, activePreset.dampingValue, activePreset.decayOverride, activePreset.brightnessOverride, isVeenaMode])
 
   useEffect(() => {
     audioEngine.setVibratoDepth(activePreset.vibValue)
@@ -266,22 +271,28 @@ export default function App() {
 
   // Wire instrument type (jawari) + sympathetic parameters to worklet on preset change
   useEffect(() => {
+    // Veena toggle overrides the preset's instrument type
+    const instrumentType = isVeenaMode ? 'veena_sitar' : activePreset.instrumentType
+    const jawariAmount = isVeenaMode ? 0.45 : activePreset.jawariAmount
+    const jawariThreshold = isVeenaMode ? 0.18 : activePreset.jawariThreshold
+
     audioEngine.setInstrumentParams({
-      type: activePreset.instrumentType,
-      jawariAmount: activePreset.jawariAmount,
-      jawariThreshold: activePreset.jawariThreshold,
+      type: instrumentType,
+      jawariAmount,
+      jawariThreshold,
     })
-    // Always update sympathetic bank — pass empty scale for guitar to disable
-    const scale = activePreset.instrumentType === 'veena_sitar'
-      ? (isDiatonic ? activePreset.scale : SCALES.kharaharapriya.degrees)
+    // Enable sympathetic strings when in veena/sitar mode
+    const useVeena = instrumentType === 'veena_sitar'
+    const scale = useVeena
+      ? (isDiatonic ? activePreset.scale : SCALES.chromatic.degrees)
       : []
     audioEngine.setSympatheticParams(
       scale,
       activePreset.startMidiNote + activePreset.rootNote,
-      activePreset.sympatheticGain,
+      useVeena ? 0.2 : activePreset.sympatheticGain,
       activePreset.sympatheticDecay,
     )
-  }, [audioEngine, activePreset, isDiatonic])
+  }, [audioEngine, activePreset, isDiatonic, isVeenaMode])
 
   // Effect presets per instrument
   useEffect(() => {
@@ -315,7 +326,8 @@ export default function App() {
     } else if (key === 'vibValue') {
       audioEngine.setVibratoDepth(val)
     } else if (key === 'dampingValue') {
-      const decay = 0.998 - val * 0.015
+      const baseDecay = 0.99996 - val * 0.0001
+      const decay = isVeenaMode ? Math.max(baseDecay, 0.99998) : baseDecay
       const brightness = 0.3 + (1 - val) * 0.5
       audioEngine.setPhysicalModelParams({ decay, brightness })
     }
@@ -328,7 +340,7 @@ export default function App() {
     } catch (e) {
       console.error('Error updating preset slider:', e)
     }
-  }, [audioEngine, activePresetIndex, presets])
+  }, [audioEngine, activePresetIndex, presets, isVeenaMode])
 
   const handleSliderDrag = useCallback((
     e: React.PointerEvent,
@@ -500,6 +512,19 @@ export default function App() {
 
         {/* Mode Button Grid */}
         <div className="gs-mode-group">
+          {/* ── Instrument Toggle ── */}
+          <div className="gs-mode-row">
+            <button
+              className={`gs-mode-btn ${!isVeenaMode ? 'gs-mode-active' : ''}`}
+              onClick={() => setIsVeenaMode(false)}
+              style={{ fontSize: '0.9em', fontWeight: 600 }}
+            >🎸 Guitar</button>
+            <button
+              className={`gs-mode-btn ${isVeenaMode ? 'gs-mode-active' : ''}`}
+              onClick={() => setIsVeenaMode(true)}
+              style={{ fontSize: '0.9em', fontWeight: 600 }}
+            >🪕 Veena</button>
+          </div>
           <div className="gs-mode-row">
             {['2nd\nHmonic', 'Piano'].map(m => (
               <button key={m} className="gs-mode-btn" style={{ whiteSpace: 'pre-line' }}>{m}</button>

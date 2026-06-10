@@ -46,7 +46,7 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
     frequency,
     velocity       = 0.8,
     brightness     = 0.5,
-    decay          = 0.992,
+    decay          = 0.99996,
     instrumentType = 'guitar',
     jawariAmount   = 0.0,
     jawariThreshold = 0.2,
@@ -329,9 +329,10 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
           v.ampEnv = Math.min(1.0, v.ampEnv + v.ampAttackRate)
         }
 
-        // Output: use filtered signal (y) for a warmer, smoother sound
-        // Slightly scale L/R differently for stereo width
-        const amp = y * v.ampEnv * 0.65
+        // Output: tap the UNFILTERED read (x) for classic KS topology
+        // The filter shapes what goes BACK into the delay (tone evolution),
+        // but the output gets the full excitation energy (louder, brighter attack)
+        const amp = x * v.ampEnv * 0.55
         outL[i] += amp
         if (outR) outR[i] += amp * 0.98
       }
