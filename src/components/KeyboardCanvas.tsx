@@ -1,6 +1,8 @@
-import React, { useRef, useEffect, useCallback } from 'react'
+import { useRef, useEffect, useCallback } from 'react'
 import { type KeyCell, type LayoutConfig, buildLayout } from '../engine/keyboard/KeyboardLayout'
-import { type VoiceManager, type TouchState } from '../engine/audio/VoiceManager'
+import { type VoiceManager } from '../engine/audio/VoiceManager'
+import { useKeyboardGesture } from '../hooks/useKeyboardGesture'
+import { KeyboardRenderer, type ActiveVoiceInfo } from '../engine/renderer/KeyboardRenderer'
 
 interface TouchPoint {
   pointerId: number
@@ -10,6 +12,7 @@ interface TouchPoint {
   initialX: number
   initialCell: KeyCell
   cell: KeyCell
+  pitchCents: number
 }
 
 interface KeyboardCanvasProps {
@@ -18,179 +21,49 @@ interface KeyboardCanvasProps {
   showSvara?: boolean
 }
 
-// Pre-draw a single key cell to an offscreen canvas for performance
-// Colors:
-//   root note in scale:    warm orange border + tinted bg
-//   in scale (not root):   cyan border + dark bg
-//   out of scale:          dim grey border + very dark bg
-//   pressed:               bright cyan fill + white text
-
-function drawGeoShredKey(
-  ctx: CanvasRenderingContext2D,
-  cell: KeyCell,
-  isPressed: boolean,
-  showSvara: boolean,
-) {
-  const { x, y, width: w, height: h, isInScale, isRoot, noteName, svaraName } = cell
-  const pad = 1.5 // gap between keys
-
-  const cx = x + w / 2
-  const cy = y + h / 2
-
-  // ─── Background ───
-  if (isPressed) {
-    // Pressed: strong cyan gradient
-    const g = ctx.createLinearGradient(x, y, x, y + h)
-    g.addColorStop(0, 'rgba(0,229,255,0.55)')
-    g.addColorStop(0.5, 'rgba(0,180,210,0.35)')
-    g.addColorStop(1, 'rgba(0,100,140,0.25)')
-    ctx.fillStyle = g
-  } else if (!isInScale) {
-    ctx.fillStyle = '#0a0c10'
-  } else if (isRoot) {
-    ctx.fillStyle = '#1a1000'
-  } else {
-    ctx.fillStyle = '#0e1118'
-  }
-
-  ctx.beginPath()
-  ctx.roundRect(x + pad, y + pad, w - pad * 2, h - pad * 2, 4)
-  ctx.fill()
-
-  // ─── Border ───
-  ctx.lineWidth = isPressed ? 2 : 1
-  if (isPressed) {
-    ctx.strokeStyle = '#00e5ff'
-  } else if (isRoot && isInScale) {
-    ctx.strokeStyle = 'rgba(255,140,40,0.75)'
-  } else if (isInScale) {
-    ctx.strokeStyle = 'rgba(0,229,255,0.45)'
-  } else {
-    ctx.strokeStyle = 'rgba(255,255,255,0.07)'
-  }
-
-  ctx.beginPath()
-  ctx.roundRect(x + pad, y + pad, w - pad * 2, h - pad * 2, 4)
-  ctx.stroke()
-
-  // ─── Concentric circle texture (guitar sound hole) ───
-  if (isInScale) {
-    const maxRadius = Math.min(w, h) * 0.38
-    const rings = 4
-    const baseAlpha = isPressed ? 0.35 : (isRoot ? 0.18 : 0.12)
-    const ringColor = isPressed
-      ? `rgba(255,255,255,` 
-      : isRoot
-        ? `rgba(255,160,60,`
-        : `rgba(0,229,255,`
-
-    for (let i = rings; i >= 1; i--) {
-      const r = (maxRadius / rings) * i
-      ctx.beginPath()
-      ctx.arc(cx, cy - h * 0.08, r, 0, Math.PI * 2)
-      ctx.strokeStyle = ringColor + (baseAlpha * (i / rings)).toFixed(2) + ')'
-      ctx.lineWidth = 0.8
-      ctx.stroke()
-    }
-
-    // Center dot
-    ctx.beginPath()
-    ctx.arc(cx, cy - h * 0.08, 2.5, 0, Math.PI * 2)
-    ctx.fillStyle = isPressed ? 'rgba(255,255,255,0.6)' : isRoot ? 'rgba(255,140,40,0.5)' : 'rgba(0,229,255,0.4)'
-    ctx.fill()
-  }
-
-  // ─── Note Label ───
-  const label = showSvara ? svaraName : noteName
-  const fontSize = Math.min(15, Math.max(10, h * 0.2))
-
-  if (isInScale) {
-    ctx.fillStyle = isPressed
-      ? '#ffffff'
-      : isRoot
-        ? '#ffa040'
-        : '#9ab0cc'
-  } else {
-    ctx.fillStyle = '#2a3040'
-  }
-
-  ctx.font = `700 ${fontSize}px "Outfit", "Inter", sans-serif`
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'alphabetic'
-  ctx.fillText(label, cx, y + h - h * 0.18)
-
-  // ─── Pressed glow overlay ───
-  if (isPressed) {
-    const glowGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.min(w, h) * 0.5)
-    glowGrad.addColorStop(0, 'rgba(0,229,255,0.2)')
-    glowGrad.addColorStop(1, 'rgba(0,229,255,0)')
-    ctx.fillStyle = glowGrad
-    ctx.beginPath()
-    ctx.roundRect(x + pad, y + pad, w - pad * 2, h - pad * 2, 4)
-    ctx.fill()
-  }
-}
-
 export function KeyboardCanvas({ config, voiceManager, showSvara = false }: KeyboardCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const activeTouches = useRef<Map<number, TouchPoint>>(new Map())
   const layout = useRef<KeyCell[]>([])
+  const rendererRef = useRef<KeyboardRenderer>(new KeyboardRenderer())
+  const rafRef = useRef<number | null>(null)
 
-  const draw = useCallback(() => {
+  // ─── Animation Loop ──────────────────────────────────────────────────────────
+
+  const renderFrame = useCallback(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    const dpr = window.devicePixelRatio || 1
-    ctx.save()
-    ctx.scale(dpr, dpr)
+    // Build the current active voice info array from touch state
+    const activeVoices: ActiveVoiceInfo[] = Array.from(activeTouches.current.values()).map((t) => ({
+      voiceId: t.pointerId,
+      pointerId: t.pointerId,
+      row: t.cell.row,
+      col: t.cell.col,
+      clientX: t.clientX,
+      clientY: t.clientY,
+      pitchCents: t.pitchCents,
+    }))
 
-    const logicalW = canvas.width / dpr
-    const logicalH = canvas.height / dpr
-    ctx.clearRect(0, 0, logicalW, logicalH)
-
-    // Background
-    ctx.fillStyle = '#080a0e'
-    ctx.fillRect(0, 0, logicalW, logicalH)
-
-    // Draw all key cells
-    const pressedSet = new Set(
-      Array.from(activeTouches.current.values()).map(t => `${t.cell.row},${t.cell.col}`)
-    )
-
-    for (const cell of layout.current) {
-      const isPressed = pressedSet.has(`${cell.row},${cell.col}`)
-      drawGeoShredKey(ctx, cell, isPressed, showSvara)
-    }
-
-    // Touch ripple indicators
-    for (const touch of activeTouches.current.values()) {
-      const rect = canvas.getBoundingClientRect()
-      const tx = touch.clientX - rect.left
-      const ty = touch.clientY - rect.top
-
-      const glow = ctx.createRadialGradient(tx, ty, 2, tx, ty, 36)
-      glow.addColorStop(0, 'rgba(0, 229, 255, 0.5)')
-      glow.addColorStop(0.5, 'rgba(0, 229, 255, 0.15)')
-      glow.addColorStop(1, 'rgba(0, 229, 255, 0)')
-      ctx.fillStyle = glow
-      ctx.beginPath()
-      ctx.arc(tx, ty, 36, 0, Math.PI * 2)
-      ctx.fill()
-
-      // Inner dot
-      ctx.beginPath()
-      ctx.arc(tx, ty, 6, 0, Math.PI * 2)
-      ctx.fillStyle = 'rgba(255,255,255,0.9)'
-      ctx.fill()
-      ctx.strokeStyle = '#00e5ff'
-      ctx.lineWidth = 2
-      ctx.stroke()
-    }
-
-    ctx.restore()
+    rendererRef.current.drawFrame(canvas, ctx, layout.current, activeVoices, showSvara ?? false)
+    rafRef.current = requestAnimationFrame(renderFrame)
   }, [showSvara])
+
+  const startLoop = useCallback(() => {
+    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
+    rafRef.current = requestAnimationFrame(renderFrame)
+  }, [renderFrame])
+
+  const stopLoop = useCallback(() => {
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+    }
+  }, [])
+
+  // ─── Layout & Resize ─────────────────────────────────────────────────────────
 
   const updateLayout = useCallback(() => {
     const canvas = canvasRef.current
@@ -200,97 +73,74 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
     canvas.width = rect.width * dpr
     canvas.height = rect.height * dpr
     layout.current = buildLayout(config, rect.width, rect.height)
-    draw()
-  }, [config, draw])
+  }, [config])
 
   useEffect(() => {
     updateLayout()
+    startLoop()
     window.addEventListener('resize', updateLayout)
-    return () => window.removeEventListener('resize', updateLayout)
-  }, [updateLayout])
+    return () => {
+      stopLoop()
+      window.removeEventListener('resize', updateLayout)
+    }
+  }, [updateLayout, startLoop, stopLoop])
 
-  const hitTest = (x: number, y: number): KeyCell | null => {
-    return layout.current.find(cell =>
-      x >= cell.x && x < cell.x + cell.width &&
-      y >= cell.y && y < cell.y + cell.height
-    ) ?? null
-  }
+  // ─── Gesture Callbacks ───────────────────────────────────────────────────────
 
   const requestRedraw = useCallback(() => {
-    requestAnimationFrame(draw)
-  }, [draw])
+    // No-op: the RAF loop handles continuous drawing.
+    // We keep this for API compatibility with useKeyboardGesture.
+  }, [])
 
-  const handlePointerDown = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
-    e.preventDefault()
-    e.currentTarget.setPointerCapture(e.pointerId)
-    const rect = e.currentTarget.getBoundingClientRect()
-    const x = e.clientX - rect.left
-    const y = e.clientY - rect.top
-    const cell = hitTest(x, y)
-    if (!cell) return
+  const onTouchDown = useCallback(
+    (_pointerId: number, cell: KeyCell, clientX: number, clientY: number, _keyZ: number) => {
+      const canvas = canvasRef.current
+      if (!canvas) return
 
-    const keyX = (x - cell.x) / cell.width
-    const keyY = 1 - (y - cell.y) / cell.height
-    const keyZ = e.pressure > 0 && e.pressure < 1 ? e.pressure : 0.5
+      const rect = canvas.getBoundingClientRect()
+      const x = clientX - rect.left
+      const y = clientY - rect.top
 
-    activeTouches.current.set(e.pointerId, {
-      pointerId: e.pointerId,
-      clientX: e.clientX,
-      clientY: e.clientY,
-      pressure: keyZ,
-      initialX: x,
-      initialCell: cell,
-      cell,
-    })
+      // Trigger ripple at exact touch point on canvas
+      rendererRef.current.triggerRipple(x, y, cell.isRoot)
+    },
+    []
+  )
 
-    const touchState: TouchState = {
-      pointerId: e.pointerId,
-      row: cell.row,
-      col: cell.col,
-      midiNote: cell.midiNote,
-      keyX,
-      keyY,
-      keyZ,
-    }
+  const onTouchMove = useCallback(
+    (
+      pointerId: number,
+      clientX: number,
+      clientY: number,
+      pitchBendCents: number
+    ) => {
+      const canvas = canvasRef.current
+      if (!canvas) return
 
-    voiceManager.handleTouchDown(touchState)
-    requestRedraw()
-  }, [voiceManager, requestRedraw])
+      const rect = canvas.getBoundingClientRect()
+      const x = clientX - rect.left
+      const y = clientY - rect.top
 
-  const handlePointerMove = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
-    const touch = activeTouches.current.get(e.pointerId)
-    if (!touch) return
+      // Feed the current pointer position into the pitch trail for this voice
+      rendererRef.current.addTrailPoint(pointerId, x, y, pitchBendCents)
+    },
+    []
+  )
 
-    const rect = e.currentTarget.getBoundingClientRect()
-    const x = e.clientX - rect.left
-    const y = e.clientY - rect.top
+  const onTouchUp = useCallback((pointerId: number) => {
+    rendererRef.current.clearTrail(pointerId)
+  }, [])
 
-    const cell = hitTest(x, y)
-    if (cell && (cell.row !== touch.cell.row || cell.col !== touch.cell.col)) {
-      touch.cell = cell
-    }
-
-    const dx = x - touch.initialX
-    const centsOffset = (dx / touch.initialCell.width) * 100
-
-    const keyY = 1 - (y - touch.cell.y) / touch.cell.height
-    const keyZ = e.pressure > 0 && e.pressure < 1 ? e.pressure : 0.5
-
-    touch.clientX = e.clientX
-    touch.clientY = e.clientY
-    touch.pressure = keyZ
-
-    voiceManager.handleTouchMove(e.pointerId, centsOffset, keyY, keyZ)
-    requestRedraw()
-  }, [voiceManager, requestRedraw])
-
-  const handlePointerUp = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
-    const touch = activeTouches.current.get(e.pointerId)
-    if (!touch) return
-    activeTouches.current.delete(e.pointerId)
-    voiceManager.handleTouchUp(e.pointerId, touch.initialCell.row)
-    requestRedraw()
-  }, [voiceManager, requestRedraw])
+  useKeyboardGesture({
+    layoutRef: layout,
+    voiceManager,
+    canvasRef,
+    activeTouchesRef: activeTouches,
+    requestRedraw,
+    onTouchDown,
+    onTouchMove,
+    onTouchUp,
+  })
 
   return (
     <canvas
@@ -303,10 +153,6 @@ export function KeyboardCanvas({ config, voiceManager, showSvara = false }: Keyb
         userSelect: 'none',
         WebkitUserSelect: 'none',
       }}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-      onPointerCancel={handlePointerUp}
       onContextMenu={(e) => e.preventDefault()}
     />
   )

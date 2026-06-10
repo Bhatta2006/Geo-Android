@@ -7,7 +7,8 @@ const WORKLET_URL = '/karplus-strong-processor.js'
 
 export interface AudioEngine {
   noteOn: (voiceId: number, midiNote: number, keyX: number, keyY: number, keyZ: number) => Promise<void>
-  noteUpdate: (voiceId: number, keyX: number, keyY: number, keyZ: number) => void
+  /** pitchBendCents: semitone deviation * 100, relative to the voice's base MIDI note */
+  noteUpdate: (voiceId: number, pitchBendCents: number, keyY: number, keyZ: number) => void
   noteOff: (voiceId: number) => void
   setEffectEnabled: (effectId: string, enabled: boolean) => void
   setEffectParam: (effectId: string, param: string, value: number) => void
@@ -97,8 +98,15 @@ export function useAudioEngine(): AudioEngine {
     })
   }
 
-  const noteUpdate = (_voiceId: number, _keyX: number, _keyY: number, _keyZ: number) => {
-    // pitch bend updates — can be re-enabled later
+  const noteUpdate = (voiceId: number, pitchBendCents: number, keyY: number, _keyZ: number) => {
+    const worklet = workletRef.current
+    if (!worklet) return
+    worklet.port.postMessage({
+      type: 'noteUpdate',
+      voiceId,
+      pitchBendCents,
+      keyY,
+    })
   }
 
   const noteOff = (voiceId: number) => {
