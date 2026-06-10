@@ -156,12 +156,15 @@ class AudioEngineImpl implements AudioEngine {
     voiceId: number,
     midiNote: number,
     _keyX: number,
-    keyY: number,
+    _keyY: number,
     _keyZ: number,
     options?: { decay?: number; brightness?: number }
   ): void {
     const frequency = 440 * Math.pow(2, (midiNote - 69) / 12)
-    const velocity = 0.6 + Math.max(0, Math.min(1, keyY)) * 0.4
+    // Use a consistent, warm velocity — not driven by keyY position
+    // (keyY varies with where on the key you touch, not how hard — hardware
+    //  pressure is unreliable on most devices, so keep it uniform)
+    const velocity = 0.82
 
     const doNoteOn = () => {
       if (!this.worklet) return
@@ -191,16 +194,15 @@ class AudioEngineImpl implements AudioEngine {
 
   noteUpdate(voiceId: number, pitchBendCents: number, keyY: number, _keyZ: number): void {
     if (!this.worklet) return
-    // Clamp to ±2 semitones (200 cents) max per-frame to avoid extreme ratios
+    // Clamp to ±24 semitones (2400 cents) max
     const clampedCents = Math.max(-2400, Math.min(2400, pitchBendCents))
     this.worklet.port.postMessage({
       type: 'noteUpdate',
       voiceId,
       pitchBendCents: clampedCents,
       keyY,
-      instrumentType: this.instParams.type,
-      jawariAmount: this.instParams.jawariAmount,
-      jawariThreshold: this.instParams.jawariThreshold,
+      // Do NOT send instrument params here — only needed on noteOn / setInstrumentParams
+      // Sending them on every pointermove causes unnecessary message overhead
     })
   }
 

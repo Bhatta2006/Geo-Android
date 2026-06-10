@@ -1,28 +1,37 @@
 // AudioWorklet Processor — runs in AudioWorkletGlobalScope
 // Plain JS only — no imports, no TypeScript syntax
+//
+// Clean Karplus-Strong string synthesis:
+//  - Warm bandlimited excitation (multi-pass smoothed noise burst)
+//  - One-pole LPF feedback loop with frequency-dependent damping
+//  - Smooth pitch bend via sample-accurate delay interpolation (linear interpolation)
+//  - Pitch bend smoothing: fast lerp toward target — slides feel live, not laggy
+//  - Soft note-on envelope to prevent click on attack
+//  - No harsh metallic artifacts
+
+const MAXBUF = 4096  // large enough for lowest notes (~20 Hz @ 44.1 kHz = 2205 samples)
 
 class KarplusStrongProcessor extends AudioWorkletProcessor {
   constructor() {
     super()
 
-    // Active KS voices (keyboard notes)
+    // Active KS voices
     this.voices = new Map()
 
-    // ── Sympathetic string bank ──────────────────────────────────────
-    // Built from active scale + root when setSympatheticParams arrives
+    // Sympathetic string bank (disabled by default — guitar preset has gain=0)
     this.sympatheticStrings = []
-    this.sympatheticGain    = 0.0    // overall output scale (0 = disabled)
+    this.sympatheticGain    = 0.0
     this.scaleDegrees       = []
     this.rootMidi           = 48
     this.sympatheticNeedRebuild = false
 
     this.port.onmessage = (e) => {
       const d = e.data
-      if (d.type === 'noteOn')              this._noteOn(d)
-      else if (d.type === 'noteOff')        this._noteOff(d)
-      else if (d.type === 'noteUpdate')     this._noteUpdate(d)
-      else if (d.type === 'setGlobalParams') this._setGlobal(d)
-      else if (d.type === 'setInstrumentParams') this._setInstrumentParams(d)
+      if      (d.type === 'noteOn')               this._noteOn(d)
+      else if (d.type === 'noteOff')              this._noteOff(d)
+      else if (d.type === 'noteUpdate')           this._noteUpdate(d)
+      else if (d.type === 'setGlobalParams')      this._setGlobal(d)
+      else if (d.type === 'setInstrumentParams')  this._setInstrumentParams(d)
       else if (d.type === 'setSympatheticParams') this._setSympatheticParams(d)
     }
   }
@@ -34,57 +43,85 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
   _noteOn({
     voiceId,
     frequency,
-    velocity,
-    brightness       = 0.5,
-    decay            = 0.992,
-    instrumentType   = 'guitar',
-    jawariAmount     = 0.0,
-    jawariThreshold  = 0.2,
+    velocity       = 0.8,
+    brightness     = 0.5,
+    decay          = 0.992,
+    instrumentType = 'guitar',
+    jawariAmount   = 0.0,
+    jawariThreshold = 0.2,
   }) {
     if (!frequency || frequency <= 0) return
 
-    const MAXBUF = 2048
+    // Delay length in samples — this is the "string length"
     const N    = sampleRate / frequency
     const Nint = Math.round(N)
-    if (Nint < 2 || Nint > MAXBUF) return
+    if (Nint < 2 || Nint > MAXBUF - 4) return
 
-    // ── Bandlimited noise excitation (models a pluck without harsh high-freq) ──
-    // Two-point averager applied to shaped noise removes aliasing artifacts
-    // that cause the 'harsh' sound on attack.
+    // ── Warm bandlimited noise excitation ──────────────────────────
+    // Step 1: fill with white noise shaped by a raised-cosine (Hann) envelope
+    // Step 2: apply 3 passes of a two-point averager → very smooth, warm pluck
+    // This removes the harsh high-frequency content that causes metallic attack
     const buf = new Float32Array(MAXBUF)
-    let prev = 0
+    const gain = velocity * 0.7  // conservative initial amplitude to prevent clipping
+
+    // Raw shaped noise
     for (let i = 0; i < Nint; i++) {
-      const env       = Math.sin(Math.PI * i / Nint)
-      const rawNoise  = (Math.random() * 2 - 1)
-      const smoothed  = (rawNoise + prev) * 0.5   // one-pole low-pass
-      prev = rawNoise
-      buf[i] = smoothed * velocity * env * 0.85
+      const env = 0.5 * (1 - Math.cos(2 * Math.PI * i / Nint))  // Hann window
+      buf[i] = (Math.random() * 2 - 1) * env * gain
     }
+
+    // Multi-pass smoothing — 3 passes of two-point average
+    // Each pass is a one-pole low-pass at Nyquist/2 → removes most aliasing
+    for (let pass = 0; pass < 3; pass++) {
+      let prev = buf[Nint - 1]  // wrap-around for circularity
+      for (let i = 0; i < Nint; i++) {
+        const cur  = buf[i]
+        buf[i] = (cur + prev) * 0.5
+        prev   = cur
+      }
+    }
+
+    // Compute loop filter coefficient from brightness
+    // brightness=0 → warm/dark (high damping), brightness=1 → bright (low damping)
+    // Standard KS one-pole LPF: y[n] = g * ((1-b)*x[n] + b*y[n-1])
+    // coefficient b controls how quickly HF energy is lost each loop
+    const loopCoeff = this._brightnessToCoeff(brightness, frequency)
 
     this.voices.set(voiceId, {
       buf,
-      MAXBUF,
-      delayLength: N,          // float delay, updated per-block for pitch bend
-      ptr: 0,
+      N,               // float delay length (original, without pitch bend)
+      ptr: 0,          // write pointer into circular buffer
       loopGain: decay,
-      brightness,
+      loopCoeff,       // LPF coefficient (b in the one-pole formula above)
       lastOut: 0,
-      releasing: false,
-      releaseDecay: 0.997,
-      // Pitch bend state — smoothed to avoid clicking/zipper noise on slides
+
+      // Pitch bend state
+      // smoothPitchBend is in CENTS relative to original frequency
+      // We smooth it toward targetPitchBendCents per-sample inside process()
       targetPitchBendCents: 0,
       smoothPitchBend: 0,
+      pitchBendActive: false,  // set true once first noteUpdate arrives
+
+      // Release state
+      releasing: false,
+      releaseDecay: 0.9975,
+
+      // Instrument type / jawari
       instrumentType,
       jawariAmount,
       jawariThreshold,
+
+      // Amplitude envelope — short soft-attack to prevent click at onset
+      // Rises from 0 to 1 over ~5ms (220 samples @ 44.1kHz)
+      ampEnv: 0.0,
+      ampAttackRate: 1 / (sampleRate * 0.006),  // fully on in ~6ms
     })
 
-    // Excite the sympathetic bank whenever a note is struck
+    // Excite sympathetic bank on note strike
     if (this.sympatheticStrings.length > 0 && this.sympatheticGain > 0.001) {
-      const excitation = velocity * 0.5
-      for (let s = 0; s < this.sympatheticStrings.length; s++) {
-        const sym = this.sympatheticStrings[s]
-        sym.buf[sym.ptr] += excitation * sym.gain * 0.05
+      const excitation = velocity * 0.4
+      for (const sym of this.sympatheticStrings) {
+        sym.buf[sym.ptr] += excitation * sym.gain * 0.04
       }
     }
   }
@@ -93,37 +130,49 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
     const v = this.voices.get(voiceId)
     if (v) {
       v.releasing    = true
-      v.releaseDecay = 0.997
+      v.releaseDecay = 0.9975
     }
   }
 
   /**
-   * Real-time pitch bend via fractional delay adjustment.
-   * pitchBendCents: deviation in cents from the voice's original MIDI note.
-   * keyY:           0–1 vertical → modulates brightness / timbre.
+   * pitchBendCents: cents relative to voice's original MIDI note.
+   *   0 = no bend, +100 = one semitone up, -100 = one semitone down.
+   * keyY: 0–1 vertical → modulates brightness (expression)
    */
   _noteUpdate({ voiceId, pitchBendCents, keyY, instrumentType, jawariAmount, jawariThreshold }) {
     const v = this.voices.get(voiceId)
     if (!v) return
-    // Store as TARGET — the process() loop smooths toward it each block
-    if (pitchBendCents  !== undefined) v.targetPitchBendCents = pitchBendCents
-    if (keyY            !== undefined) v.brightness = 0.1 + Math.max(0, Math.min(1, keyY)) * 0.65
-    if (instrumentType  !== undefined) v.instrumentType    = instrumentType
-    if (jawariAmount    !== undefined) v.jawariAmount      = jawariAmount
-    if (jawariThreshold !== undefined) v.jawariThreshold   = jawariThreshold
+
+    if (pitchBendCents !== undefined) {
+      // Clamp to ±24 semitones (2400 cents) maximum
+      v.targetPitchBendCents = Math.max(-2400, Math.min(2400, pitchBendCents))
+      v.pitchBendActive = true
+    }
+    if (keyY !== undefined) {
+      // keyY=1 (top of key, near nut) → brighter tone
+      // keyY=0 (bottom of key, near soundhole) → warmer, darker tone
+      // Keep within a warm range (0.2 to 0.70) to avoid harshness at extremes
+      const targetBrightness = 0.20 + Math.max(0, Math.min(1, keyY)) * 0.50
+      v.loopCoeff = this._brightnessToCoeff(targetBrightness, sampleRate / v.N)
+    }
+    if (instrumentType  !== undefined) v.instrumentType  = instrumentType
+    if (jawariAmount    !== undefined) v.jawariAmount    = jawariAmount
+    if (jawariThreshold !== undefined) v.jawariThreshold = jawariThreshold
   }
 
   _setGlobal({ decay, brightness }) {
     for (const v of this.voices.values()) {
       if (!v.releasing) {
         if (decay      !== undefined) v.loopGain  = decay
-        if (brightness !== undefined) v.brightness = brightness
+        if (brightness !== undefined) {
+          const freq = sampleRate / v.N
+          v.loopCoeff = this._brightnessToCoeff(brightness, freq)
+        }
       }
     }
   }
 
   _setInstrumentParams({ instrumentType, jawariAmount, jawariThreshold }) {
-    // Apply to all currently-running voices
     for (const v of this.voices.values()) {
       if (instrumentType  !== undefined) v.instrumentType  = instrumentType
       if (jawariAmount    !== undefined) v.jawariAmount    = jawariAmount
@@ -136,15 +185,42 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
     if (rootMidi        !== undefined) this.rootMidi     = rootMidi
     if (sympatheticGain !== undefined) this.sympatheticGain = sympatheticGain
     if (sympatheticDecay !== undefined) {
-      // update decay on existing strings without rebuild
       for (const sym of this.sympatheticStrings) sym.decay = sympatheticDecay
     }
     this.sympatheticNeedRebuild = true
   }
 
   // ─────────────────────────────────────────────────────────────────
-  //  Sympathetic resonator bank — built lazily from scale + root
-  //  Matches Section 5.3 of GeoShred_Phase2.md exactly.
+  //  Brightness → one-pole LPF coefficient
+  //  Maps user-facing "brightness" (0=dark, 1=bright) to the
+  //  feedback coefficient b in: y = g * ((1-b)*x + b*y_prev)
+  //  At low frequencies the string needs more HF damping to sound right.
+  // ─────────────────────────────────────────────────────────────────
+  _brightnessToCoeff(brightness, frequency) {
+    // Base coefficient: brightness=0 → b=0.85 (dark), brightness=1 → b=0.45 (bright)
+    const base = 0.85 - brightness * 0.40
+
+    // Frequency correction: lower strings need more HF damping
+    // A string at 82 Hz (E2) should sound warmer than 1318 Hz (E6)
+    const freqFactor = Math.max(0, Math.min(0.12, (400 - frequency) / 4000))
+    return Math.max(0.1, Math.min(0.92, base + freqFactor))
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  //  Jawari (bridge-buzz) nonlinear effect — veena/sitar only
+  // ─────────────────────────────────────────────────────────────────
+  _jawari(sample, amount, threshold) {
+    const absVal = Math.abs(sample)
+    if (absVal > threshold) {
+      const excess = absVal - threshold
+      const buzz   = Math.sin(excess * 60) * excess * amount
+      return sample + buzz * Math.sign(sample)
+    }
+    return sample
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  //  Sympathetic resonator bank
   // ─────────────────────────────────────────────────────────────────
   _rebuildSympatheticBank() {
     this.sympatheticStrings = []
@@ -153,12 +229,11 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
     if (!this.scaleDegrees || this.scaleDegrees.length === 0) return
     if (this.sympatheticGain <= 0.001) return
 
-    // Build strings for scale notes over 2 octaves
     for (const degree of this.scaleDegrees) {
       for (let oct = 0; oct < 2; oct++) {
-        const midi = this.rootMidi + degree + oct * 12
-        const freq = 440 * Math.pow(2, (midi - 69) / 12)
-        if (freq <= 0 || freq > 16000) continue
+        const midi  = this.rootMidi + degree + oct * 12
+        const freq  = 440 * Math.pow(2, (midi - 69) / 12)
+        if (freq <= 0 || freq > 8000) continue
 
         const length  = sampleRate / freq
         const bufSize = Math.ceil(length) + 4
@@ -166,25 +241,11 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
           buf:    new Float32Array(bufSize),
           ptr:    0,
           length: length,
-          gain:   0.15,              // per-string gain (plan: 0.1–0.3, default 0.15)
-          decay:  0.9985,            // very long ring (plan default)
+          gain:   0.12,
+          decay:  0.9985,
         })
       }
     }
-  }
-
-  // ─────────────────────────────────────────────────────────────────
-  //  Jawari (bridge-buzz) nonlinear filter — Section 5.2
-  //  Applied on the LOOP FILTER input (before the one-pole LPF).
-  // ─────────────────────────────────────────────────────────────────
-  _jawari(sample, amount, threshold) {
-    const absVal = Math.abs(sample)
-    if (absVal > threshold) {
-      const excess        = absVal - threshold
-      const buzzComponent = Math.sin(excess * 80) * excess * amount
-      return sample + buzzComponent * Math.sign(sample)
-    }
-    return sample
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -197,102 +258,97 @@ class KarplusStrongProcessor extends AudioWorkletProcessor {
 
     const len = outL.length
 
-    // Lazy rebuild of sympathetic bank
     if (this.sympatheticNeedRebuild) this._rebuildSympatheticBank()
 
-    // Clear output buffers
-    for (let i = 0; i < len; i++) {
-      outL[i] = 0.0
-      if (outR) outR[i] = 0.0
-    }
+    // Clear outputs
+    outL.fill(0)
+    if (outR) outR.fill(0)
 
     // ── Process each KS voice ────────────────────────────────────────
     for (const [id, v] of this.voices) {
-      // ── Smooth pitch bend toward target (4% per block = ~10ms at 128 samp/44.1kHz)
-      // This prevents zipper noise / clicking during fast slides.
-      const targetBend = v.targetPitchBendCents ?? 0
-      v.smoothPitchBend = v.smoothPitchBend !== undefined
-        ? v.smoothPitchBend + (targetBend - v.smoothPitchBend) * 0.04
-        : targetBend
 
-      // Compute effective delay from SMOOTHED pitch bend — 2^(cents/1200)
-      const bendRatio = Math.pow(2, v.smoothPitchBend / 1200)
-      const rawDelay  = v.delayLength / bendRatio
-      const D         = Math.max(2, Math.min(v.MAXBUF - 2, rawDelay))
-      const Dint      = Math.floor(D)
-      const frac      = D - Dint
+      // Per-sample pitch bend smoothing
+      // Use a fast lerp rate so slides feel live:
+      // ~15% per sample when pitch bend is active → reaches target in ~20 samples (~0.5ms)
+      // This is fast enough to feel like a continuous slide, slow enough to avoid clicks
+      const bendLerpRate = v.pitchBendActive ? 0.15 : 1.0
 
       for (let i = 0; i < len; i++) {
-        // ── 3rd-order Lagrange fractional delay read ───────────────
-        const r0 = (v.ptr - Dint     + v.MAXBUF) % v.MAXBUF
-        const r1 = (v.ptr - Dint - 1 + v.MAXBUF) % v.MAXBUF
-        const r2 = (v.ptr - Dint + 1 + v.MAXBUF) % v.MAXBUF
-        const r3 = (v.ptr - Dint - 2 + v.MAXBUF) % v.MAXBUF
+        // ── Smooth pitch bend ──────────────────────────────────────
+        v.smoothPitchBend += (v.targetPitchBendCents - v.smoothPitchBend) * bendLerpRate
 
-        const d  = frac
-        const c0 = (-d * (d - 1) * (d - 2)) / 6
-        const c1 = ((d + 1) * (d - 1) * (d - 2)) / 2
-        const c2 = (-(d + 1) * d * (d - 2)) / 2
-        const c3 = ((d + 1) * d * (d - 1)) / 6
+        // Effective delay length = original / frequency ratio from bend
+        // pitchBendCents: +100 = up one semitone → shorter delay = higher pitch
+        const bendRatio = Math.pow(2, v.smoothPitchBend / 1200)
+        const D = Math.max(2, Math.min(MAXBUF - 2, v.N / bendRatio))
 
-        const x = v.buf[r1] * c0 + v.buf[r0] * c1 + v.buf[r2] * c2 + v.buf[r3] * c3
+        // ── Linear interpolated delay read ────────────────────────
+        // More efficient than Lagrange for real-time slides, and sounds identical
+        // to the ear during continuous pitch glide
+        const Dint = Math.floor(D)
+        const frac = D - Dint
 
-        // ── Jawari bridge-buzz (veena_sitar only) ──────────────────
+        const r0 = (v.ptr - Dint     + MAXBUF) % MAXBUF
+        const r1 = (v.ptr - Dint - 1 + MAXBUF) % MAXBUF
+
+        const x = v.buf[r0] + frac * (v.buf[r1] - v.buf[r0])
+
+        // ── Jawari (veena/sitar buzz) ──────────────────────────────
         let loopIn = x
         if (v.instrumentType === 'veena_sitar') {
-          loopIn = this._jawari(x, v.jawariAmount ?? 0.5, v.jawariThreshold ?? 0.2)
+          loopIn = this._jawari(x, v.jawariAmount ?? 0.0, v.jawariThreshold ?? 0.2)
         }
 
-        // ── One-pole LPF loop filter (Karplus-Strong sustain) ──────
-        const y = v.loopGain * ((1 - v.brightness) * loopIn + v.brightness * v.lastOut)
+        // ── One-pole LPF loop filter ───────────────────────────────
+        // y[n] = loopGain * ((1 - b) * x[n] + b * y[n-1])
+        // b = loopCoeff controls warmth/brightness of string decay
+        const y = v.loopGain * ((1 - v.loopCoeff) * loopIn + v.loopCoeff * v.lastOut)
         v.lastOut = y
 
-        // Write back
+        // Write filtered output back into delay line
         v.buf[v.ptr] = y
-        v.ptr = (v.ptr + 1) % v.MAXBUF
+        v.ptr = (v.ptr + 1) % MAXBUF
 
-        const amp = x * 0.5
+        // ── Soft amplitude attack (prevents click on note-on) ──────
+        if (v.ampEnv < 1.0) {
+          v.ampEnv = Math.min(1.0, v.ampEnv + v.ampAttackRate)
+        }
+
+        // Output: use filtered signal (y) for a warmer, smoother sound
+        // Slightly scale L/R differently for stereo width
+        const amp = y * v.ampEnv * 0.65
         outL[i] += amp
-        if (outR) outR[i] += amp
+        if (outR) outR[i] += amp * 0.98
       }
 
-      // Release ramp
+      // Release ramp — applied per-block (not per-sample) for efficiency
       if (v.releasing) {
-        v.loopGain *= v.releaseDecay
-        if (v.loopGain < 0.0001) { this.voices.delete(id); continue }
+        v.loopGain *= Math.pow(v.releaseDecay, len)
+        if (v.loopGain < 0.0001) {
+          this.voices.delete(id)
+          continue
+        }
       }
 
       // Silence cleanup
-      if (Math.abs(v.lastOut) < 1e-7 && !v.releasing) {
+      if (Math.abs(v.lastOut) < 5e-8 && !v.releasing) {
         this.voices.delete(id)
       }
     }
 
-    // Copy mono → stereo
-    if (outR) {
-      for (let i = 0; i < len; i++) outR[i] = outL[i]
-    }
-
     // ── Sympathetic Resonator Bank ────────────────────────────────
-    // Exact implementation from Section 5.3 of GeoShred_Phase2.md:
-    //   readPtr = (writePtr - floor(length) + bufLen) % bufLen
-    //   filtered = decay * (sample + buf[readPtr+1]) * 0.5
-    //   write back + mix excitation from main output
-    //   output[i] += sample * gain  (with overall sympatheticGain scale)
     if (this.sympatheticStrings.length > 0 && this.sympatheticGain > 0.001) {
       for (let i = 0; i < len; i++) {
         let symSum = 0.0
 
-        for (let s = 0; s < this.sympatheticStrings.length; s++) {
-          const sym     = this.sympatheticStrings[s]
+        for (const sym of this.sympatheticStrings) {
           const bufLen  = sym.buf.length
           const readPtr = (sym.ptr - Math.floor(sym.length) + bufLen) % bufLen
           const sample  = sym.buf[readPtr]
 
-          // Loop filter from plan: decay * (s[n] + s[n+1]) * 0.5
+          // Simple two-point averaged loop filter
           const filtered = sym.decay * (sample + sym.buf[(readPtr + 1) % bufLen]) * 0.5
 
-          // Write back — also couple a tiny fraction of the main output in
           sym.buf[sym.ptr] = filtered
           sym.ptr = (sym.ptr + 1) % bufLen
 
